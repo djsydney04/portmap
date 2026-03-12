@@ -184,7 +184,7 @@ The exact base path follows the platform data directory returned by the Node/Rus
 
 ## Open source
 
-`portledger` is open source and community-driven. Issues, ideas, and pull requests are welcome.
+`portledger` is open source.
 
 ## Contributing
 
