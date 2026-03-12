@@ -25,6 +25,7 @@ Then run it from that same project root:
 
 ```bash
 npx port
+npx portledger
 ```
 
 Optional global install:
@@ -62,6 +63,7 @@ Required repository secret:
 
 ```bash
 port
+portledger
 port map
 port map --interactive
 port map --plain
@@ -76,6 +78,7 @@ port run -- npm run dev
 ## Dashboard view
 
 Running `port` (with no args) opens the interactive dashboard.
+`portledger` is an alias for the same command.
 `port map` prints one-shot output unless you pass `--interactive`.
 
 - Use `Up` and `Down` to inspect sessions.
