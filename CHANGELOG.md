@@ -1,5 +1,19 @@
 # Changelog
 
+## [0.4.0](https://github.com/djsydney04/portLedger/compare/portledger-v0.3.0...portledger-v0.4.0) (2026-03-12)
+
+
+### Features
+
+* add portledger CLI alias (minor release) ([9f817c4](https://github.com/djsydney04/portLedger/commit/9f817c4647fb5534b6c631017d408cf8056f3293))
+* add portledger CLI alias (minor release) ([9b1fd36](https://github.com/djsydney04/portLedger/commit/9b1fd3690e0f200820f97aff999021716f595d53))
+
+
+### Bug Fixes
+
+* **tui:** keep dashboard command bar visible on small terminals ([3a2ff5c](https://github.com/djsydney04/portLedger/commit/3a2ff5c33556f8e41e362c7691c84b9497746375))
+* **tui:** keep dashboard command bar visible on small terminals ([d77cf3b](https://github.com/djsydney04/portLedger/commit/d77cf3be51a47857302aa162cd87f1b20c284c3d))
+
 ## [0.3.0](https://github.com/djsydney04/portLedger/compare/portledger-v0.2.1...portledger-v0.3.0) (2026-03-12)
 
 
