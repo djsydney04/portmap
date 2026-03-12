@@ -2473,65 +2473,94 @@ fn build_dashboard_lines(
         .count();
 
     let (list_height, detail_height) = dashboard_layout(height, !state.rows.is_empty());
+    let list_inner_width = width.saturating_sub(2);
 
     let mut lines = Vec::with_capacity(height);
-    lines.push(format!(
-        "portledger dashboard  ports:{}  processes:{}  stale:{}  projects:{}",
-        summary.ports, summary.processes, summary.stale, summary.projects
+    lines.push(box_top(width, "Overview"));
+    lines.push(box_line(
+        width,
+        &format!(
+            "ports:{}  processes:{}  stale:{}  projects:{}",
+            summary.ports, summary.processes, summary.stale, summary.projects
+        ),
     ));
-    lines.push(format!(
-        "free:{}  released:{}  refresh:{}  stale-after:{}  filter:{}  sort:{}  visible:{}/{}",
-        free_ports,
-        released_count,
-        format_duration_short(args.refresh_every),
-        format_duration_short(args.stale_after),
-        state.filter_label(),
-        state.sort_label(),
-        state.rows.len(),
-        state.all_rows.len()
+    lines.push(box_line(
+        width,
+        &format!(
+            "free:{}  released:{}  refresh:{}  stale-after:{}",
+            free_ports,
+            released_count,
+            format_duration_short(args.refresh_every),
+            format_duration_short(args.stale_after)
+        ),
     ));
-    lines.push(separator_line(width));
-    lines.push("Sessions".to_string());
-    lines.push(format_session_header(width));
+    lines.push(box_line(
+        width,
+        &format!(
+            "filter:{}  sort:{}  visible:{}/{}",
+            state.filter_label(),
+            state.sort_label(),
+            state.rows.len(),
+            state.all_rows.len()
+        ),
+    ));
+    lines.push(box_bottom(width));
+
+    lines.push(box_top(
+        width,
+        &format!("Sessions ({}/{})", state.rows.len(), state.all_rows.len()),
+    ));
+    lines.push(box_line(width, &format_session_header(list_inner_width)));
 
     let start = visible_row_start(state.selected, state.rows.len(), list_height);
     for offset in 0..list_height {
         let index = start + offset;
         if let Some(row) = state.rows.get(index) {
-            lines.push(format_session_row(
-                row,
+            lines.push(box_line(
                 width,
-                index == state.selected,
-                state.health_for(row),
+                &format_session_row(
+                    row,
+                    list_inner_width,
+                    index == state.selected,
+                    state.health_for(row),
+                ),
             ));
         } else if state.rows.is_empty() && offset == 0 {
-            lines.push(
-                "  No rows match current filter. Use `clear`, `filter ...`, or `refresh`."
-                    .to_string(),
-            );
+            lines.push(box_line(
+                width,
+                "No rows match current filter. Use `clear`, `filter ...`, or `refresh`.",
+            ));
         } else {
-            lines.push(String::new());
+            lines.push(box_line(width, ""));
         }
     }
+    lines.push(box_bottom(width));
 
-    lines.push(separator_line(width));
-    lines.push(if state.show_command_menu {
-        "Command Menu".to_string()
-    } else {
-        "Details".to_string()
-    });
-
+    lines.push(box_top(
+        width,
+        if state.show_command_menu {
+            "Command Menu"
+        } else {
+            "Details"
+        },
+    ));
     let detail_lines = if state.show_command_menu {
         build_command_menu_lines()
     } else {
         build_detail_lines(state)
     };
     for index in 0..detail_height {
-        lines.push(detail_lines.get(index).cloned().unwrap_or_default());
+        lines.push(box_line(
+            width,
+            detail_lines
+                .get(index)
+                .map(String::as_str)
+                .unwrap_or_default(),
+        ));
     }
+    lines.push(box_bottom(width));
 
-    lines.push(separator_line(width));
-    lines.push("Hotkeys: ?/F1 toggle menu, Esc closes menu/clears input, Ctrl+C quit".to_string());
+    lines.push("Hotkeys: ?/F1 menu, Esc close/clear, Ctrl+C quit".to_string());
     lines.push(format!("Status: {}", state.message.render()));
     lines.push(format!(
         "Command > {}",
@@ -2577,6 +2606,45 @@ fn build_dashboard_summary(snapshot: &Snapshot) -> DashboardExportSummary {
         stale,
         projects,
     }
+}
+
+fn box_top(width: usize, title: &str) -> String {
+    if width == 0 {
+        return String::new();
+    }
+    if width == 1 {
+        return "┌".to_string();
+    }
+
+    let inner = width.saturating_sub(2);
+    let label = truncate_end(&format!(" {} ", title), inner);
+    let trailing = inner.saturating_sub(label.chars().count());
+    format!("┌{}{}┐", label, "─".repeat(trailing))
+}
+
+fn box_bottom(width: usize) -> String {
+    if width == 0 {
+        return String::new();
+    }
+    if width == 1 {
+        return "└".to_string();
+    }
+
+    format!("└{}┘", "─".repeat(width.saturating_sub(2)))
+}
+
+fn box_line(width: usize, content: &str) -> String {
+    if width == 0 {
+        return String::new();
+    }
+    if width == 1 {
+        return "│".to_string();
+    }
+
+    let inner = width.saturating_sub(2);
+    let body = truncate_end(content, inner);
+    let padding = inner.saturating_sub(body.chars().count());
+    format!("│{}{}│", body, " ".repeat(padding))
 }
 
 fn build_detail_lines(state: &DashboardState) -> Vec<String> {
@@ -2701,10 +2769,12 @@ fn build_command_menu_lines() -> Vec<String> {
 }
 
 fn format_session_header(width: usize) -> String {
-    truncate_end(
-        "  Port  State  Health  Age   PID   PPID TTY      Project           URL",
-        width,
-    )
+    let prefix = format!(
+        "{} {:>5} {:<6} {:<7} {:>5} {:>6} {:>6} {:<8} ",
+        " ", "Port", "State", "Health", "Age", "PID", "PPID", "TTY"
+    );
+    let remaining = width.saturating_sub(prefix.chars().count());
+    format!("{}{}", prefix, truncate_end("Project  URL", remaining))
 }
 
 fn format_session_row(
@@ -2760,7 +2830,9 @@ fn visible_row_start(selected: usize, total: usize, height: usize) -> usize {
 }
 
 fn dashboard_layout(height: usize, has_rows: bool) -> (usize, usize) {
-    let fixed_lines = 11usize;
+    // Non-resizable lines:
+    // 5 overview + 3 session framing + 2 detail framing + 3 footer/prompt lines.
+    let fixed_lines = 13usize;
     let body_lines = height.saturating_sub(fixed_lines);
     let mut list_height = body_lines.saturating_mul(3) / 5;
     let mut detail_height = body_lines.saturating_sub(list_height);
@@ -2792,10 +2864,6 @@ fn probe_rows_by_keys(state: &mut DashboardState, keys: &[(u16, i32)], timeout: 
         let health = probe_port_health(*port, timeout);
         state.apply_health_sample(*port, *pid, health);
     }
-}
-
-fn separator_line(width: usize) -> String {
-    "─".repeat(width.max(1))
 }
 
 fn truncate_end(value: &str, max: usize) -> String {

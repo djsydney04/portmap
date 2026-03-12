@@ -2,6 +2,19 @@
 
 `portledger` keeps a persistent map of which local project owns which TCP port, shows which ports are free, and helps clean up stale dev servers before retrying your command.
 
+## Quick start
+
+```bash
+npm i portledger
+npx port
+```
+
+Or run a dev server with conflict handling:
+
+```bash
+npx port run -- npm run dev
+```
+
 ## What it does
 
 - Scans local listening TCP ports and groups them by project root.
@@ -18,13 +31,14 @@ Install in your project root (`<your-repo>/`) so everyone can run it with `npx`:
 
 ```bash
 cd <your-repo>
-npm install --save-dev portledger
+npm i portledger
 ```
 
 Then run it from that same project root:
 
 ```bash
 npx port
+npx portledger
 ```
 
 Optional global install:
@@ -37,6 +51,26 @@ If you are developing from this repo directly, install from the repo root:
 
 ```bash
 npm install -g .
+```
+
+## Typical workflow
+
+1. Start the dashboard:
+
+```bash
+npx port
+```
+
+2. If your app needs a specific port, preflight and run:
+
+```bash
+npx port run --port 3000 -- npm run dev
+```
+
+3. If a stale process is blocking a port, release it:
+
+```bash
+npx port release 3000
 ```
 
 ## Release flow
@@ -62,6 +96,9 @@ Required repository secret:
 
 ```bash
 port
+portledger
+npx port
+npx portledger
 port map
 port map --interactive
 port map --plain
@@ -76,6 +113,7 @@ port run -- npm run dev
 ## Dashboard view
 
 Running `port` (with no args) opens the interactive dashboard.
+`portledger` is an alias for the same command.
 `port map` prints one-shot output unless you pass `--interactive`.
 
 - Use `Up` and `Down` to inspect sessions.
@@ -116,7 +154,7 @@ The dashboard now includes persistent filter/sort state, visible-row health prob
 Default list order is now `new -> old` by process age.
 Detail rows include PPID, TTY, first/last seen timestamps, project root, working directory, health details, and URL hints.
 
-## Shell helpers
+## Shell helpers (optional)
 
 Generate wrapper functions:
 
