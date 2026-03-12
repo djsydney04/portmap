@@ -1,0 +1,37 @@
+{
+  "name": "portmap",
+  "version": "0.1.0",
+  "description": "Persistent visual map of local ports, stale listeners, and project ownership",
+  "bin": {
+    "portmap": "bin/portmap.cjs"
+  },
+  "files": [
+    "bin",
+    "scripts",
+    "src",
+    "Cargo.toml",
+    "Cargo.lock",
+    "README.md"
+  ],
+  "scripts": {
+    "build": "node scripts/install.js --build-only",
+    "install": "node scripts/install.js",
+    "prepack": "node scripts/install.js --build-only",
+    "test": "cargo test"
+  },
+  "keywords": [
+    "ports",
+    "devtools",
+    "cli",
+    "rust"
+  ],
+  "license": "MIT",
+  "os": [
+    "darwin",
+    "linux"
+  ],
+  "cpu": [
+    "x64",
+    "arm64"
+  ]
+}
