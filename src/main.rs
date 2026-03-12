@@ -117,6 +117,10 @@ struct MapArgs {
     #[arg(long)]
     all: bool,
 
+    /// Open the interactive dashboard view
+    #[arg(long)]
+    interactive: bool,
+
     /// Print the one-shot table view instead of the interactive dashboard
     #[arg(long)]
     plain: bool,
@@ -297,23 +301,30 @@ fn main() -> ExitCode {
 fn run() -> Result<ExitCode> {
     let cli = Cli::parse();
 
-    match cli.command.unwrap_or(Commands::Map(MapArgs {
-        all: false,
-        plain: false,
-        refresh_every: DEFAULT_DASHBOARD_REFRESH,
-        stale_after: DEFAULT_STALE_AFTER,
-    })) {
-        Commands::Map(args) => cmd_map(args),
-        Commands::Status(args) => cmd_status(args),
-        Commands::Available(args) => cmd_available(args),
-        Commands::Release(args) => cmd_release(args),
-        Commands::Run(args) => cmd_run(args),
-        Commands::Hook(args) => cmd_hook(args),
+    match cli.command {
+        None => cmd_map(MapArgs {
+            all: false,
+            interactive: true,
+            plain: false,
+            refresh_every: DEFAULT_DASHBOARD_REFRESH,
+            stale_after: DEFAULT_STALE_AFTER,
+        }),
+        Some(Commands::Map(args)) => cmd_map(args),
+        Some(Commands::Status(args)) => cmd_status(args),
+        Some(Commands::Available(args)) => cmd_available(args),
+        Some(Commands::Release(args)) => cmd_release(args),
+        Some(Commands::Run(args)) => cmd_run(args),
+        Some(Commands::Hook(args)) => cmd_hook(args),
     }
 }
 
 fn cmd_map(args: MapArgs) -> Result<ExitCode> {
-    if !args.plain && !args.all && io::stdin().is_terminal() && io::stdout().is_terminal() {
+    if args.interactive
+        && !args.plain
+        && !args.all
+        && io::stdin().is_terminal()
+        && io::stdout().is_terminal()
+    {
         return run_dashboard(args);
     }
 

@@ -63,6 +63,7 @@ Required repository secret:
 ```bash
 portmap
 portmap map
+portmap map --interactive
 portmap map --plain
 portmap map --all
 portmap status 3000
@@ -74,7 +75,8 @@ portmap run -- npm run dev
 
 ## Dashboard view
 
-Running `portmap` or `portmap map` in a terminal now opens an interactive dashboard instead of printing a one-shot table.
+Running `portmap` (with no args) opens the interactive dashboard.
+`portmap map` prints one-shot output unless you pass `--interactive`.
 
 - Use `Up` and `Down` to inspect sessions.
 - Type commands in the bottom command box and press `Enter`.
@@ -141,3 +143,19 @@ State is written to:
 - macOS/Linux: `~/.local/share/portmap/state.json` when `XDG_DATA_HOME` is unset
 
 The exact base path follows the platform data directory returned by the Node/Rust environment.
+
+## Open source
+
+`portmap` is open source and community-driven. Issues, ideas, and pull requests are welcome.
+
+## Contributing
+
+Contributions of all sizes are welcome, including bug fixes, docs improvements, and feature work.
+
+Basic workflow:
+
+1. Fork the repo and create a branch for your change.
+2. Make your update and test it locally.
+3. Open a pull request with a clear description of what changed and why.
+
+If you are unsure where to start, open an issue describing the problem or proposal first.
