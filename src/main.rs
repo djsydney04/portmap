@@ -1211,9 +1211,9 @@ fn query_processes(pids: &[i32]) -> Result<HashMap<i32, ProcessMeta>> {
     Ok(processes)
 }
 
-fn parse_ps_line(
-    line: &str,
-) -> Option<(i32, Option<i32>, Option<String>, Option<Duration>, String)> {
+type ParsedPsLine = (i32, Option<i32>, Option<String>, Option<Duration>, String);
+
+fn parse_ps_line(line: &str) -> Option<ParsedPsLine> {
     let mut parts = line.split_whitespace();
     let pid = parts.next()?.parse::<i32>().ok()?;
     let ppid = parts.next().and_then(|value| value.parse::<i32>().ok());

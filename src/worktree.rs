@@ -90,7 +90,7 @@ pub fn discover_current_repo() -> Result<Option<RepoSnapshot>> {
 }
 
 pub fn discover_repo_from(cwd: &Path) -> Result<Option<RepoSnapshot>> {
-    let Some(root_raw) = git_stdout(&cwd, &["rev-parse", "--show-toplevel"]).ok() else {
+    let Some(root_raw) = git_stdout(cwd, &["rev-parse", "--show-toplevel"]).ok() else {
         return Ok(None);
     };
     let root = normalize_existing_path(PathBuf::from(root_raw));
