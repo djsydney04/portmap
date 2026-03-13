@@ -1,5 +1,5 @@
 [package]
-name = "portledger"
+name = "cli-cockpit"
 version = "0.1.0"
 edition = "2021"
 description = "Persistent visual map of local ports and project ownership"

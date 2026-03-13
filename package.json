@@ -1,10 +1,10 @@
 {
-  "name": "portledger",
+  "name": "cli-cockpit",
   "version": "0.1.0",
-
   "description": "Persistent visual map of local ports, stale listeners, and project ownership",
   "bin": {
     "port": "bin/port.cjs",
+    "cli-cockpit": "bin/port.cjs",
     "portledger": "bin/port.cjs"
   },
   "files": [
@@ -19,7 +19,7 @@
     "build": "node scripts/install.js --build-only",
     "install": "node scripts/install.js",
     "prepack": "node scripts/install.js --build-only",
-    "test": "cargo test"
+    "test": "cargo test && node --test scripts/update-check.test.cjs"
   },
   "keywords": [
     "ports",
@@ -35,8 +35,5 @@
   "cpu": [
     "x64",
     "arm64"
-  ],
-  "dependencies": {
-    "portledger": "^0.3.0"
-  }
+  ]
 }

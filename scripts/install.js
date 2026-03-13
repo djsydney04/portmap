@@ -5,7 +5,7 @@ const path = require("path");
 const { spawnSync } = require("child_process");
 
 const root = path.resolve(__dirname, "..");
-const binaryName = process.platform === "win32" ? "portledger.exe" : "portledger";
+const binaryName = process.platform === "win32" ? "cli-cockpit.exe" : "cli-cockpit";
 const sourceBinary = path.join(root, "target", "release", binaryName);
 const destDir = path.join(root, "bin", "native");
 const destBinary = path.join(destDir, binaryName);
@@ -18,7 +18,9 @@ const build = spawnSync(cargo, ["build", "--release"], {
 
 if (build.error) {
   if (build.error.code === "ENOENT") {
-    console.error("Rust toolchain not found. Install cargo to build the native portledger binary.");
+    console.error(
+      "Rust toolchain not found. Install cargo to build the native cli-cockpit binary."
+    );
   } else {
     console.error(build.error.message);
   }
