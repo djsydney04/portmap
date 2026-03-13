@@ -3,7 +3,7 @@
   "packages": {
     ".": {
       "release-type": "node",
-      "package-name": "portledger",
+      "package-name": "cli-cockpit",
       "extra-files": [
         {
           "type": "toml",

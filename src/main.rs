@@ -10,6 +10,8 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
+mod worktree;
+
 use anyhow::{anyhow, bail, Context, Result};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use comfy_table::{
@@ -29,6 +31,11 @@ use dialoguer::Confirm;
 use once_cell::sync::Lazy;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use worktree::{
+    active_operation, discover_current_repo, run_git, RepoSnapshot, WorktreeOperation,
+    WorktreeRecord,
+};
 
 const DEFAULT_STALE_AFTER: Duration = Duration::from_secs(30 * 60);
 const DEFAULT_DASHBOARD_REFRESH: Duration = Duration::from_secs(3);
@@ -37,7 +44,7 @@ const DEFAULT_AVAILABLE_TO: u16 = 3999;
 const DEFAULT_AVAILABLE_COUNT: usize = 12;
 const RELEASE_HISTORY_LIMIT: usize = 8;
 const CAPTURE_LIMIT: usize = 64 * 1024;
-const DEFAULT_EXPORT_FILENAME: &str = "portledger-dashboard.json";
+const DEFAULT_EXPORT_FILENAME: &str = "cli-cockpit-dashboard.json";
 const DASHBOARD_MOVE_WAIT: Duration = Duration::from_secs(12);
 const QUICK_ACTION_OLD_AFTER: Duration = Duration::from_secs(2 * 60 * 60);
 
@@ -86,10 +93,12 @@ static PROJECT_MARKERS: &[&str] = &[
 
 #[derive(Parser, Debug)]
 #[command(
-    name = "port",
-    bin_name = "port",
+    name = "cockpit",
+    bin_name = "cockpit",
     version,
-    about = "Persistent visual map of what's running on which ports"
+    about = "Port and worktree cockpit for local development",
+    long_about = "Port and worktree cockpit for local development.\n\nRunning `cockpit` with no command opens the interactive dashboard.",
+    after_help = "Examples:\n  cockpit                              Open the interactive dashboard\n  cockpit dashboard                    Open the interactive dashboard via explicit command\n  cockpit map --plain                  Print one-shot table output\n  cockpit status 3000                  Inspect one port and owner history\n  cockpit free --from 3000 --to 3100   Show likely free ports\n  cockpit kill 3000                    Release a busy port\n  cockpit run --port 3000 -- npm run dev"
 )]
 struct Cli {
     #[command(subcommand)]
@@ -99,16 +108,22 @@ struct Cli {
 #[derive(Subcommand, Debug)]
 enum Commands {
     /// Show the current port map
+    #[command(visible_aliases = ["dashboard", "cockpit"])]
     Map(MapArgs),
     /// Inspect one port and show its current or last known owner
+    #[command(visible_aliases = ["info", "inspect"])]
     Status(StatusArgs),
     /// Find free ports in a range
+    #[command(visible_aliases = ["free", "find-free"])]
     Available(AvailableArgs),
     /// Kill the process currently listening on a port
+    #[command(visible_aliases = ["kill", "stop"])]
     Release(ReleaseArgs),
     /// Run a command, detect port conflicts, and offer stale-port cleanup
+    #[command(visible_aliases = ["exec", "wrap"])]
     Run(RunArgs),
-    /// Print shell helpers for wrapping dev commands with port
+    /// Print shell helpers for wrapping dev commands with cockpit
+    #[command(visible_aliases = ["shell", "helpers"])]
     Hook(HookArgs),
 }
 
@@ -522,26 +537,26 @@ fn cmd_hook(args: HookArgs) -> Result<ExitCode> {
         Shell::Bash | Shell::Zsh => {
             println!(
                 r#"pmrun() {{
-  command port run -- "$@"
+  command cockpit run -- "$@"
 }}
 
 pmport() {{
   local port="$1"
   shift
-  command port run --port "$port" -- "$@"
+  command cockpit run --port "$port" -- "$@"
 }}"#
             );
         }
         Shell::Fish => {
             println!(
                 r#"function pmrun
-  command port run -- $argv
+  command cockpit run -- $argv
 end
 
 function pmport
   set -l port $argv[1]
   set -e argv[1]
-  command port run --port $port -- $argv
+  command cockpit run --port $port -- $argv
 end"#
             );
         }
@@ -595,7 +610,7 @@ fn maybe_resolve_conflict(
 
     println!();
     println!(
-        "Portledger left port {} alone because it does not look stale. Use `port release {}` if you want to stop it manually.",
+        "Portledger left port {} alone because it does not look stale. Use `cockpit release {}` if you want to stop it manually.",
         port, port
     );
     Ok(false)
@@ -629,12 +644,77 @@ struct DashboardState {
     all_rows: Vec<DashboardRow>,
     rows: Vec<DashboardRow>,
     selected: usize,
-    input: String,
     message: DashboardMessage,
     filter: Option<DashboardFilter>,
     sort: DashboardSort,
     health_cache: HashMap<(u16, i32), HealthStatus>,
+}
+
+#[derive(Debug, Clone)]
+struct WorktreeDashboardState {
+    repo: Option<RepoSnapshot>,
+    rows: Vec<WorktreeRow>,
+    all_rows: Vec<WorktreeRow>,
+    selected: usize,
+    filter: Option<WorktreeFilter>,
+    sort: WorktreeSort,
+    message: DashboardMessage,
+    last_task: Option<WorktreeTaskResult>,
+}
+
+#[derive(Debug, Clone)]
+struct WorktreeRow {
+    worktree: WorktreeRecord,
+}
+
+#[derive(Debug, Clone)]
+struct CockpitState {
+    view: CockpitView,
+    ports: DashboardState,
+    worktrees: WorktreeDashboardState,
+    input: String,
     show_command_menu: bool,
+    pending_confirmation: Option<PendingConfirmation>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CockpitView {
+    Ports,
+    Worktrees,
+}
+
+#[derive(Debug, Clone)]
+struct PendingConfirmation {
+    prompt: String,
+    action: ConfirmableAction,
+}
+
+#[derive(Debug, Clone)]
+enum ConfirmableAction {
+    RemoveWorktree {
+        target: String,
+        force: bool,
+    },
+    PruneWorktrees {
+        dry_run: bool,
+    },
+    CherryPickWorktree {
+        target: String,
+        commits: Vec<String>,
+    },
+    MergeWorktree {
+        target: String,
+        reference: String,
+    },
+    RebaseWorktree {
+        target: String,
+        reference: String,
+    },
+    ResetWorktree {
+        target: String,
+        mode: ResetMode,
+        reference: String,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -727,6 +807,158 @@ enum HealthStatus {
     Down(String),
 }
 
+#[derive(Debug, Clone)]
+enum WorktreeFilter {
+    Dirty,
+    Clean,
+    Conflicted,
+    Locked,
+    Prunable,
+    Detached,
+    BranchContains(String),
+    PathContains(String),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct WorktreeSort {
+    key: WorktreeSortKey,
+    direction: SortDirection,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WorktreeSortKey {
+    Path,
+    Branch,
+    Sync,
+    Changes,
+    State,
+    Stale,
+}
+
+#[derive(Debug, Clone)]
+enum WorktreeCommand {
+    Add(WorktreeAddRequest),
+    Open(Option<String>),
+    Switch(WorktreeSwitchRequest),
+    Move(WorktreeMoveRequest),
+    Lock(WorktreeLockRequest),
+    Unlock(Option<String>),
+    Remove(WorktreeRemoveRequest),
+    Prune { dry_run: bool },
+    CherryPick(WorktreeCherryPickRequest),
+    Merge(WorktreeRefRequest),
+    Rebase(WorktreeRefRequest),
+    Reset(WorktreeResetRequest),
+    Continue(Option<String>),
+    Abort(Option<String>),
+    Sync(WorktreeSyncRequest),
+    Task(WorktreeTaskRequest),
+}
+
+#[derive(Debug, Clone)]
+struct WorktreeAddRequest {
+    path: String,
+    branch: Option<String>,
+    from_ref: Option<String>,
+    detach: bool,
+    no_checkout: bool,
+    lock: bool,
+    implicit_path_from_branch: bool,
+}
+
+#[derive(Debug, Clone)]
+struct WorktreeSwitchRequest {
+    reference: String,
+    target: Option<String>,
+    create: bool,
+    track: bool,
+}
+
+#[derive(Debug, Clone)]
+struct WorktreeMoveRequest {
+    new_path: String,
+    target: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct WorktreeLockRequest {
+    target: Option<String>,
+    reason: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct WorktreeRemoveRequest {
+    target: Option<String>,
+    force: bool,
+}
+
+#[derive(Debug, Clone)]
+struct WorktreeCherryPickRequest {
+    commits: Vec<String>,
+    target: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct WorktreeRefRequest {
+    reference: String,
+    target: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct WorktreeResetRequest {
+    mode: ResetMode,
+    reference: String,
+    target: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct WorktreeSyncRequest {
+    target: Option<String>,
+    from_ref: Option<String>,
+    mode: WorktreeSyncMode,
+    all: bool,
+    include_dirty: bool,
+    include_main: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WorktreeSyncMode {
+    Rebase,
+    Merge,
+}
+
+#[derive(Debug, Clone)]
+struct WorktreeTaskRequest {
+    preset: WorktreeTaskPreset,
+    target: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WorktreeTaskPreset {
+    Test,
+    Lint,
+    Build,
+}
+
+#[derive(Debug, Clone)]
+struct WorktreeTaskResult {
+    target_path: PathBuf,
+    preset: WorktreeTaskPreset,
+    command: String,
+    success: bool,
+    exit_code: i32,
+    duration: Duration,
+    output_tail: Vec<String>,
+    finished_at_epoch: i64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ResetMode {
+    Soft,
+    Mixed,
+    Hard,
+}
+
 #[derive(Debug, Clone, Serialize)]
 struct DashboardExport {
     exported_at_epoch: i64,
@@ -736,6 +968,10 @@ struct DashboardExport {
     free_ports: Vec<u16>,
     active: Vec<DashboardExportPort>,
     recent_released: Vec<DashboardExportReleased>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    repo: Option<DashboardExportRepo>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    worktrees: Option<Vec<DashboardExportWorktree>>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -779,6 +1015,50 @@ struct DashboardExportReleased {
     first_seen_epoch: i64,
     last_seen_epoch: i64,
     released_at_epoch: Option<i64>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct DashboardExportRepo {
+    root: PathBuf,
+    common_dir: PathBuf,
+    worktree_count: usize,
+    dirty: usize,
+    locked: usize,
+    prunable: usize,
+    detached: usize,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct DashboardExportWorktree {
+    path: PathBuf,
+    is_main: bool,
+    branch: Option<String>,
+    detached: bool,
+    locked: bool,
+    lock_reason: Option<String>,
+    prunable: bool,
+    prunable_reason: Option<String>,
+    upstream: Option<String>,
+    ahead: u32,
+    behind: u32,
+    origin_ref: Option<String>,
+    origin_ahead: u32,
+    origin_behind: u32,
+    base_ref: Option<String>,
+    base_ahead: u32,
+    base_behind: u32,
+    merged_into_base: Option<bool>,
+    head_oid: String,
+    git_dir: Option<PathBuf>,
+    operations: Vec<String>,
+    staged: Vec<String>,
+    unstaged: Vec<String>,
+    untracked: Vec<String>,
+    conflicted: Vec<String>,
+    last_commit_epoch: Option<i64>,
+    last_commit_subject: Option<String>,
+    last_checkout_epoch: Option<i64>,
+    stale_score: u32,
 }
 
 fn discover_active_ports(stale_after: Duration) -> Result<Vec<PortSnapshot>> {
@@ -931,9 +1211,9 @@ fn query_processes(pids: &[i32]) -> Result<HashMap<i32, ProcessMeta>> {
     Ok(processes)
 }
 
-fn parse_ps_line(
-    line: &str,
-) -> Option<(i32, Option<i32>, Option<String>, Option<Duration>, String)> {
+type ParsedPsLine = (i32, Option<i32>, Option<String>, Option<Duration>, String);
+
+fn parse_ps_line(line: &str) -> Option<ParsedPsLine> {
     let mut parts = line.split_whitespace();
     let pid = parts.next()?.parse::<i32>().ok()?;
     let ppid = parts.next().and_then(|value| value.parse::<i32>().ok());
@@ -1067,7 +1347,17 @@ fn save_state(state: &StateFile) -> Result<()> {
 fn state_file_path() -> Result<PathBuf> {
     let base =
         dirs::data_local_dir().ok_or_else(|| anyhow!("could not determine data directory"))?;
-    Ok(base.join("portledger").join("state.json"))
+    let current = base.join("cli-cockpit").join("state.json");
+    if current.exists() {
+        return Ok(current);
+    }
+
+    let legacy = base.join("portledger").join("state.json");
+    if legacy.exists() {
+        return Ok(legacy);
+    }
+
+    Ok(current)
 }
 
 fn merge_state(state: &mut StateFile, active: &[PortSnapshot]) {
@@ -1134,14 +1424,12 @@ impl DashboardState {
             all_rows: Vec::new(),
             rows: Vec::new(),
             selected: 0,
-            input: String::new(),
             message: DashboardMessage::info(
                 "Use ? or F1 for command menu. Use Up/Down to inspect sessions. Ctrl+C quits.",
             ),
             filter: None,
             sort: DashboardSort::default(),
             health_cache: HashMap::new(),
-            show_command_menu: false,
         };
         state.rebuild_rows(None);
         state
@@ -1244,6 +1532,200 @@ impl DashboardState {
     }
 }
 
+impl WorktreeDashboardState {
+    fn new(repo: Option<RepoSnapshot>) -> Self {
+        let mut state = Self {
+            repo,
+            rows: Vec::new(),
+            all_rows: Vec::new(),
+            selected: 0,
+            filter: None,
+            sort: WorktreeSort::default(),
+            message: DashboardMessage::info(
+                "Press Tab to switch views. In Worktrees, try `new feature-x`, `sync all --from main`, or `task test`.",
+            ),
+            last_task: None,
+        };
+        state.rebuild_rows(None);
+        state
+    }
+
+    fn selected_row(&self) -> Option<&WorktreeRow> {
+        self.rows.get(self.selected)
+    }
+
+    fn selected_key(&self) -> Option<String> {
+        self.selected_row()
+            .map(|row| row.worktree.path.display().to_string())
+    }
+
+    fn apply_repo(&mut self, repo: Option<RepoSnapshot>) {
+        self.repo = repo;
+        self.rebuild_rows(None);
+    }
+
+    fn rebuild_rows(&mut self, preferred_path: Option<&str>) {
+        let selected_key = preferred_path
+            .map(ToOwned::to_owned)
+            .or_else(|| self.selected_key());
+        self.all_rows = self
+            .repo
+            .as_ref()
+            .map(build_worktree_rows)
+            .unwrap_or_default();
+        self.rows = self
+            .all_rows
+            .iter()
+            .filter(|row| self.filter_matches(row))
+            .cloned()
+            .collect();
+        self.sort_rows();
+        self.selected = if self.rows.is_empty() {
+            0
+        } else if let Some(path) = selected_key {
+            self.rows
+                .iter()
+                .position(|row| row.worktree.path == Path::new(&path))
+                .unwrap_or_else(|| self.selected.min(self.rows.len().saturating_sub(1)))
+        } else {
+            self.selected.min(self.rows.len().saturating_sub(1))
+        };
+    }
+
+    fn filter_matches(&self, row: &WorktreeRow) -> bool {
+        match self.filter.as_ref() {
+            None => true,
+            Some(WorktreeFilter::Dirty) => row.worktree.is_dirty(),
+            Some(WorktreeFilter::Clean) => !row.worktree.is_dirty(),
+            Some(WorktreeFilter::Conflicted) => !row.worktree.conflicted.is_empty(),
+            Some(WorktreeFilter::Locked) => row.worktree.locked,
+            Some(WorktreeFilter::Prunable) => row.worktree.prunable,
+            Some(WorktreeFilter::Detached) => row.worktree.detached,
+            Some(WorktreeFilter::BranchContains(needle)) => row
+                .worktree
+                .branch_label()
+                .to_ascii_lowercase()
+                .contains(needle),
+            Some(WorktreeFilter::PathContains(needle)) => row
+                .worktree
+                .path
+                .display()
+                .to_string()
+                .to_ascii_lowercase()
+                .contains(needle),
+        }
+    }
+
+    fn sort_rows(&mut self) {
+        let sort = self.sort;
+        self.rows.sort_by(|left, right| {
+            let base = compare_worktrees_by_sort(sort.key, sort.direction, left, right);
+            if base == Ordering::Equal {
+                left.worktree.path.cmp(&right.worktree.path)
+            } else {
+                base
+            }
+        });
+    }
+
+    fn filter_label(&self) -> String {
+        self.filter
+            .as_ref()
+            .map(WorktreeFilter::label)
+            .unwrap_or_else(|| "none".to_string())
+    }
+
+    fn sort_label(&self) -> String {
+        format!("{} {}", self.sort.key.label(), self.sort.direction.label())
+    }
+}
+
+impl CockpitState {
+    fn new(ports: DashboardState, worktrees: WorktreeDashboardState) -> Self {
+        Self {
+            view: CockpitView::Ports,
+            ports,
+            worktrees,
+            input: String::new(),
+            show_command_menu: false,
+            pending_confirmation: None,
+        }
+    }
+
+    fn active_message(&self) -> &DashboardMessage {
+        match self.view {
+            CockpitView::Ports => &self.ports.message,
+            CockpitView::Worktrees => &self.worktrees.message,
+        }
+    }
+
+    fn active_message_mut(&mut self) -> &mut DashboardMessage {
+        match self.view {
+            CockpitView::Ports => &mut self.ports.message,
+            CockpitView::Worktrees => &mut self.worktrees.message,
+        }
+    }
+
+    fn move_selection_up(&mut self, amount: usize) {
+        match self.view {
+            CockpitView::Ports => {
+                self.ports.selected = self.ports.selected.saturating_sub(amount);
+            }
+            CockpitView::Worktrees => {
+                self.worktrees.selected = self.worktrees.selected.saturating_sub(amount);
+            }
+        }
+    }
+
+    fn move_selection_down(&mut self, amount: usize) {
+        match self.view {
+            CockpitView::Ports => {
+                if !self.ports.rows.is_empty() {
+                    self.ports.selected =
+                        (self.ports.selected + amount).min(self.ports.rows.len().saturating_sub(1));
+                }
+            }
+            CockpitView::Worktrees => {
+                if !self.worktrees.rows.is_empty() {
+                    self.worktrees.selected = (self.worktrees.selected + amount)
+                        .min(self.worktrees.rows.len().saturating_sub(1));
+                }
+            }
+        }
+    }
+
+    fn move_selection_home(&mut self) {
+        match self.view {
+            CockpitView::Ports => self.ports.selected = 0,
+            CockpitView::Worktrees => self.worktrees.selected = 0,
+        }
+    }
+
+    fn move_selection_end(&mut self) {
+        match self.view {
+            CockpitView::Ports => {
+                if !self.ports.rows.is_empty() {
+                    self.ports.selected = self.ports.rows.len().saturating_sub(1);
+                }
+            }
+            CockpitView::Worktrees => {
+                if !self.worktrees.rows.is_empty() {
+                    self.worktrees.selected = self.worktrees.rows.len().saturating_sub(1);
+                }
+            }
+        }
+    }
+}
+
+impl CockpitView {
+    fn label(&self) -> &'static str {
+        match self {
+            CockpitView::Ports => "ports",
+            CockpitView::Worktrees => "worktrees",
+        }
+    }
+}
+
 impl DashboardRow {
     fn key(&self) -> (u16, i32) {
         (self.port, self.owner.pid)
@@ -1251,6 +1733,12 @@ impl DashboardRow {
 
     fn url(&self) -> String {
         format!("http://127.0.0.1:{}", self.port)
+    }
+}
+
+impl WorktreeRow {
+    fn key(&self) -> &Path {
+        &self.worktree.path
     }
 }
 
@@ -1277,6 +1765,34 @@ impl DashboardSortKey {
             DashboardSortKey::Age => "age",
             DashboardSortKey::State => "state",
             DashboardSortKey::Health => "health",
+        }
+    }
+}
+
+impl WorktreeSort {
+    fn label(&self) -> String {
+        format!("{} {}", self.key.label(), self.direction.label())
+    }
+}
+
+impl Default for WorktreeSort {
+    fn default() -> Self {
+        Self {
+            key: WorktreeSortKey::State,
+            direction: SortDirection::Desc,
+        }
+    }
+}
+
+impl WorktreeSortKey {
+    fn label(&self) -> &'static str {
+        match self {
+            WorktreeSortKey::Path => "path",
+            WorktreeSortKey::Branch => "branch",
+            WorktreeSortKey::Sync => "sync",
+            WorktreeSortKey::Changes => "changes",
+            WorktreeSortKey::State => "state",
+            WorktreeSortKey::Stale => "stale",
         }
     }
 }
@@ -1336,6 +1852,239 @@ impl DashboardFilter {
             DashboardFilter::ProjectContains(value) => format!("project:{}", value),
             DashboardFilter::CommandContains(value) => format!("cmd:{}", value),
         }
+    }
+}
+
+impl WorktreeFilter {
+    fn parse(input: &str) -> Result<Self> {
+        let trimmed = input.trim();
+        if trimmed.is_empty() {
+            bail!("usage: filter <expr>");
+        }
+
+        let normalized = trimmed.to_ascii_lowercase();
+        match normalized.as_str() {
+            "dirty" => return Ok(Self::Dirty),
+            "clean" => return Ok(Self::Clean),
+            "conflicted" => return Ok(Self::Conflicted),
+            "locked" => return Ok(Self::Locked),
+            "prunable" => return Ok(Self::Prunable),
+            "detached" => return Ok(Self::Detached),
+            _ => {}
+        }
+
+        if let Some(branch) = normalized.strip_prefix("branch:") {
+            if branch.is_empty() {
+                bail!("usage: filter branch:<substring>");
+            }
+            return Ok(Self::BranchContains(branch.to_string()));
+        }
+        if let Some(path) = normalized.strip_prefix("path:") {
+            if path.is_empty() {
+                bail!("usage: filter path:<substring>");
+            }
+            return Ok(Self::PathContains(path.to_string()));
+        }
+
+        bail!("unknown filter `{}`", trimmed)
+    }
+
+    fn label(&self) -> String {
+        match self {
+            WorktreeFilter::Dirty => "dirty".to_string(),
+            WorktreeFilter::Clean => "clean".to_string(),
+            WorktreeFilter::Conflicted => "conflicted".to_string(),
+            WorktreeFilter::Locked => "locked".to_string(),
+            WorktreeFilter::Prunable => "prunable".to_string(),
+            WorktreeFilter::Detached => "detached".to_string(),
+            WorktreeFilter::BranchContains(value) => format!("branch:{}", value),
+            WorktreeFilter::PathContains(value) => format!("path:{}", value),
+        }
+    }
+}
+
+impl WorktreeRecord {
+    fn branch_label(&self) -> String {
+        self.branch
+            .clone()
+            .unwrap_or_else(|| "detached".to_string())
+    }
+
+    fn kind_label(&self) -> &'static str {
+        if self.is_main {
+            "main"
+        } else if self.detached {
+            "detached"
+        } else {
+            "linked"
+        }
+    }
+
+    fn change_count(&self) -> usize {
+        self.staged.len() + self.unstaged.len() + self.untracked.len() + self.conflicted.len()
+    }
+
+    fn is_dirty(&self) -> bool {
+        self.change_count() > 0
+    }
+
+    fn sync_score(&self) -> (u32, u32, u32) {
+        (self.ahead + self.behind, self.behind, self.ahead)
+    }
+
+    fn unpushed_count(&self) -> Option<u32> {
+        if self.upstream.is_some() {
+            Some(self.ahead)
+        } else if self.origin_ref.is_some() {
+            Some(self.origin_ahead)
+        } else {
+            None
+        }
+    }
+
+    fn has_in_progress_operation(&self) -> bool {
+        !self.operations.is_empty()
+    }
+
+    fn stale_score(&self, now_epoch: i64) -> u32 {
+        let mut score = 0u32;
+        let commit_days = self
+            .last_commit
+            .as_ref()
+            .and_then(|commit| {
+                if commit.committed_at_epoch > 0 && commit.committed_at_epoch <= now_epoch {
+                    Some(((now_epoch - commit.committed_at_epoch) as u64 / 86_400).min(365))
+                } else {
+                    None
+                }
+            })
+            .unwrap_or(0);
+        score = score.saturating_add(commit_days as u32);
+
+        let checkout_days = self
+            .last_checkout_epoch
+            .and_then(|epoch| {
+                if epoch > 0 && epoch <= now_epoch {
+                    Some(((now_epoch - epoch) as u64 / 86_400).min(365))
+                } else {
+                    None
+                }
+            })
+            .unwrap_or(0);
+        score = score.saturating_add((checkout_days as u32).saturating_mul(2));
+
+        if !self.is_dirty() {
+            score = score.saturating_add(40);
+        } else {
+            score = score.saturating_sub(20);
+        }
+
+        match self.merged_into_base {
+            Some(true) => score = score.saturating_add(80),
+            Some(false) => score = score.saturating_sub(15),
+            None => {}
+        }
+
+        match self.unpushed_count() {
+            Some(0) => score = score.saturating_add(10),
+            Some(_) => score = score.saturating_sub(20),
+            None => {}
+        }
+
+        if self.has_in_progress_operation() {
+            score = score.saturating_sub(80);
+        }
+        if self.locked {
+            score = score.saturating_sub(30);
+        }
+        if self.is_main {
+            score = score.saturating_sub(120);
+        }
+
+        score
+    }
+
+    fn state_rank(&self) -> u8 {
+        if !self.conflicted.is_empty() {
+            5
+        } else if !self.operations.is_empty() {
+            4
+        } else if self.prunable {
+            3
+        } else if self.locked {
+            2
+        } else if self.is_dirty() {
+            1
+        } else {
+            0
+        }
+    }
+
+    fn flag_summary(&self) -> String {
+        let mut flags = Vec::new();
+        if self.is_dirty() {
+            flags.push("dirty".to_string());
+        } else {
+            flags.push("clean".to_string());
+        }
+        if self.locked {
+            flags.push("locked".to_string());
+        }
+        if self.prunable {
+            flags.push("prunable".to_string());
+        }
+        if self.unpushed_count().unwrap_or(0) > 0 {
+            flags.push(format!("unpushed:{}", self.unpushed_count().unwrap_or(0)));
+        }
+        match self.merged_into_base {
+            Some(true) => flags.push("merged".to_string()),
+            Some(false) => flags.push("unmerged".to_string()),
+            None => {}
+        }
+        for operation in &self.operations {
+            flags.push(operation.label().to_string());
+        }
+        flags.join(",")
+    }
+}
+
+fn build_worktree_rows(repo: &RepoSnapshot) -> Vec<WorktreeRow> {
+    repo.worktrees
+        .iter()
+        .cloned()
+        .map(|worktree| WorktreeRow { worktree })
+        .collect()
+}
+
+fn compare_worktrees_by_sort(
+    key: WorktreeSortKey,
+    direction: SortDirection,
+    left: &WorktreeRow,
+    right: &WorktreeRow,
+) -> Ordering {
+    let now_epoch = now_epoch();
+    let ordering = match key {
+        WorktreeSortKey::Path => left.worktree.path.cmp(&right.worktree.path),
+        WorktreeSortKey::Branch => left
+            .worktree
+            .branch_label()
+            .to_ascii_lowercase()
+            .cmp(&right.worktree.branch_label().to_ascii_lowercase()),
+        WorktreeSortKey::Sync => left.worktree.sync_score().cmp(&right.worktree.sync_score()),
+        WorktreeSortKey::Changes => left
+            .worktree
+            .change_count()
+            .cmp(&right.worktree.change_count()),
+        WorktreeSortKey::State => left.worktree.state_rank().cmp(&right.worktree.state_rank()),
+        WorktreeSortKey::Stale => left
+            .worktree
+            .stale_score(now_epoch)
+            .cmp(&right.worktree.stale_score(now_epoch)),
+    };
+
+    match direction {
+        SortDirection::Asc => ordering,
+        SortDirection::Desc => ordering.reverse(),
     }
 }
 
@@ -1460,9 +2209,11 @@ impl Drop for TerminalGuard {
 
 fn run_dashboard(args: MapArgs) -> Result<ExitCode> {
     let snapshot = refresh_snapshot(args.stale_after)?;
-    let mut state = DashboardState::new(snapshot);
-    probe_visible_rows(&mut state, Duration::from_millis(180))?;
-    state.rebuild_rows(None);
+    let mut ports = DashboardState::new(snapshot);
+    probe_visible_rows(&mut ports, Duration::from_millis(180))?;
+    ports.rebuild_rows(None);
+    let worktrees = WorktreeDashboardState::new(discover_current_repo()?);
+    let mut state = CockpitState::new(ports, worktrees);
     let mut stdout = io::stdout();
     let _guard = TerminalGuard::enter(&mut stdout)?;
     let mut last_refresh = Instant::now();
@@ -1478,19 +2229,9 @@ fn run_dashboard(args: MapArgs) -> Result<ExitCode> {
         }
 
         if last_refresh.elapsed() >= args.refresh_every {
-            match refresh_snapshot(args.stale_after) {
-                Ok(snapshot) => {
-                    state.apply_snapshot(snapshot);
-                    if let Err(error) = probe_visible_rows(&mut state, Duration::from_millis(180)) {
-                        state.message =
-                            DashboardMessage::error(format!("health probe failed: {error:#}"));
-                    } else {
-                        state.rebuild_rows(None);
-                    }
-                }
-                Err(error) => {
-                    state.message = DashboardMessage::error(format!("refresh failed: {error:#}"));
-                }
+            if let Err(error) = refresh_active_view(&mut state, args.stale_after) {
+                *state.active_message_mut() =
+                    DashboardMessage::error(format!("refresh failed: {error:#}"));
             }
             last_refresh = Instant::now();
         }
@@ -1499,11 +2240,7 @@ fn run_dashboard(args: MapArgs) -> Result<ExitCode> {
     Ok(ExitCode::SUCCESS)
 }
 
-fn handle_dashboard_event(
-    state: &mut DashboardState,
-    event: Event,
-    args: &MapArgs,
-) -> Result<bool> {
+fn handle_dashboard_event(state: &mut CockpitState, event: Event, args: &MapArgs) -> Result<bool> {
     let Event::Key(key) = event else {
         return Ok(false);
     };
@@ -1524,45 +2261,47 @@ fn handle_dashboard_event(
     }
 
     match key.code {
+        KeyCode::Tab => {
+            switch_view(state, next_view(state.view), args.stale_after)?;
+        }
+        KeyCode::BackTab => {
+            switch_view(state, previous_view(state.view), args.stale_after)?;
+        }
         KeyCode::F(1) => {
             state.show_command_menu = !state.show_command_menu;
-            state.message = DashboardMessage::info(if state.show_command_menu {
+            *state.active_message_mut() = DashboardMessage::info(if state.show_command_menu {
                 "Opened command menu."
             } else {
                 "Closed command menu."
             });
         }
         KeyCode::Up => {
-            state.selected = state.selected.saturating_sub(1);
+            state.move_selection_up(1);
         }
         KeyCode::Down => {
-            if !state.rows.is_empty() {
-                state.selected = (state.selected + 1).min(state.rows.len().saturating_sub(1));
-            }
+            state.move_selection_down(1);
         }
         KeyCode::PageUp => {
-            state.selected = state.selected.saturating_sub(5);
+            state.move_selection_up(5);
         }
         KeyCode::PageDown => {
-            if !state.rows.is_empty() {
-                state.selected = (state.selected + 5).min(state.rows.len().saturating_sub(1));
-            }
+            state.move_selection_down(5);
         }
         KeyCode::Home => {
-            state.selected = 0;
+            state.move_selection_home();
         }
         KeyCode::End => {
-            if !state.rows.is_empty() {
-                state.selected = state.rows.len().saturating_sub(1);
-            }
+            state.move_selection_end();
         }
         KeyCode::Esc => {
-            if state.show_command_menu {
+            if state.pending_confirmation.take().is_some() {
+                *state.active_message_mut() = DashboardMessage::info("Canceled pending action.");
+            } else if state.show_command_menu {
                 state.show_command_menu = false;
-                state.message = DashboardMessage::info("Closed command menu.");
+                *state.active_message_mut() = DashboardMessage::info("Closed command menu.");
             } else {
                 state.input.clear();
-                state.message = DashboardMessage::info("Cleared command input.");
+                *state.active_message_mut() = DashboardMessage::info("Cleared command input.");
             }
         }
         KeyCode::Backspace => {
@@ -1571,18 +2310,22 @@ fn handle_dashboard_event(
         KeyCode::Enter => {
             let input = std::mem::take(&mut state.input);
             if input.trim().is_empty() {
-                state.message =
-                    DashboardMessage::info("Enter a command or use Up/Down to inspect sessions.");
+                *state.active_message_mut() =
+                    DashboardMessage::info("Enter a command or use Up/Down to inspect rows.");
                 return Ok(false);
             }
 
-            if execute_dashboard_command(&input, state, args)? {
-                return Ok(true);
+            match execute_cockpit_command(&input, state, args) {
+                Ok(true) => return Ok(true),
+                Ok(false) => {}
+                Err(error) => {
+                    *state.active_message_mut() = DashboardMessage::error(format!("{error:#}"));
+                }
             }
         }
         KeyCode::Char('?') if state.input.is_empty() => {
             state.show_command_menu = !state.show_command_menu;
-            state.message = DashboardMessage::info(if state.show_command_menu {
+            *state.active_message_mut() = DashboardMessage::info(if state.show_command_menu {
                 "Opened command menu."
             } else {
                 "Closed command menu."
@@ -1598,6 +2341,340 @@ fn handle_dashboard_event(
     }
 
     Ok(false)
+}
+
+fn execute_cockpit_command(input: &str, state: &mut CockpitState, args: &MapArgs) -> Result<bool> {
+    let trimmed = input.trim();
+    let normalized = trimmed.to_ascii_lowercase();
+
+    if state.pending_confirmation.is_some() {
+        return match normalized.as_str() {
+            "yes" | "y" => {
+                execute_pending_confirmation(state)?;
+                Ok(false)
+            }
+            "no" | "n" => {
+                state.pending_confirmation = None;
+                *state.active_message_mut() = DashboardMessage::info("Canceled pending action.");
+                Ok(false)
+            }
+            "quit" | "exit" | "q" => Ok(true),
+            _ => {
+                *state.active_message_mut() =
+                    DashboardMessage::info("Type `yes` or `no` to resolve the pending action.");
+                Ok(false)
+            }
+        };
+    }
+
+    if trimmed.is_empty() {
+        refresh_active_view(state, args.stale_after)?;
+        return Ok(false);
+    }
+
+    if normalized == "help"
+        || normalized == "?"
+        || normalized.starts_with("help ")
+        || normalized.starts_with("? ")
+        || matches!(normalized.as_str(), "commands" | "command" | "menu")
+    {
+        state.show_command_menu = true;
+        *state.active_message_mut() =
+            DashboardMessage::info(build_help_message(state.view, parse_help_topic(trimmed)));
+        return Ok(false);
+    }
+
+    if matches!(normalized.as_str(), "quit" | "exit" | "q") {
+        return Ok(true);
+    }
+
+    if matches!(normalized.as_str(), "refresh" | "r") {
+        refresh_active_view(state, args.stale_after)?;
+        return Ok(false);
+    }
+
+    if matches!(normalized.as_str(), "yes" | "y" | "no" | "n") {
+        *state.active_message_mut() =
+            DashboardMessage::info("No action is waiting for confirmation.");
+        return Ok(false);
+    }
+
+    if matches!(normalized.as_str(), "ports" | "port") {
+        switch_view(state, CockpitView::Ports, args.stale_after)?;
+        return Ok(false);
+    }
+
+    if matches!(normalized.as_str(), "worktrees" | "worktree" | "git") {
+        switch_view(state, CockpitView::Worktrees, args.stale_after)?;
+        return Ok(false);
+    }
+
+    if let Some(view_name) = normalized.strip_prefix("view ") {
+        let view = match view_name.trim() {
+            "ports" | "port" => CockpitView::Ports,
+            "worktrees" | "worktree" | "git" => CockpitView::Worktrees,
+            other => bail!("unknown view `{other}`"),
+        };
+        switch_view(state, view, args.stale_after)?;
+        return Ok(false);
+    }
+
+    if normalized.starts_with("download")
+        || normalized.starts_with("export")
+        || normalized == "d"
+        || normalized.starts_with("d ")
+    {
+        let path = parse_download_target(trimmed)?;
+        let snapshot = refresh_snapshot(args.stale_after)?;
+        let repo = discover_current_repo()?;
+        let export_path = resolve_export_path(path.as_deref())?;
+        export_dashboard_snapshot(&snapshot, repo.as_ref(), args.stale_after, &export_path)?;
+        state.ports.apply_snapshot(snapshot);
+        state.worktrees.apply_repo(repo);
+        *state.active_message_mut() =
+            DashboardMessage::success(format!("Wrote {}", export_path.display()));
+        return Ok(false);
+    }
+
+    if let Some(rest) = strip_worktree_command_prefix(trimmed) {
+        execute_worktree_command(rest.trim(), state)?;
+        return Ok(false);
+    }
+
+    if matches!(state.view, CockpitView::Worktrees) && is_bare_worktree_command(trimmed) {
+        execute_worktree_command(trimmed, state)?;
+        return Ok(false);
+    }
+
+    match state.view {
+        CockpitView::Ports => execute_dashboard_command(trimmed, &mut state.ports, args),
+        CockpitView::Worktrees => execute_worktree_view_command(trimmed, state),
+    }
+}
+
+fn parse_help_topic(input: &str) -> Option<&str> {
+    let trimmed = input.trim();
+    if trimmed == "help"
+        || trimmed == "?"
+        || trimmed == "commands"
+        || trimmed == "command"
+        || trimmed == "menu"
+    {
+        return None;
+    }
+
+    trimmed
+        .strip_prefix("help ")
+        .or_else(|| trimmed.strip_prefix("? "))
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+}
+
+fn build_help_message(view: CockpitView, topic: Option<&str>) -> String {
+    match topic.map(|value| value.to_ascii_lowercase()) {
+        Some(topic) if matches!(topic.as_str(), "ports" | "port") => {
+            "Ports: restart/kill/move/open/select/filter/sort/clear. Use `ports` to jump here."
+                .to_string()
+        }
+        Some(topic) if matches!(topic.as_str(), "worktrees" | "worktree" | "git") => {
+            "Worktrees: use bare verbs like `new`, `switch`, `remove`, `sync all`, `task test`, or explicit prefixes `wt` / `worktree`."
+                .to_string()
+        }
+        Some(topic) if matches!(topic.as_str(), "commands" | "command" | "menu") => {
+            "Opened command menu. Use `ports`, `worktrees`, `download`, `yes`, and `no` as top-level commands."
+                .to_string()
+        }
+        Some(other) => format!("No dedicated help topic for `{other}`. Use `help ports`, `help worktrees`, or `commands`."),
+        None => match view {
+            CockpitView::Ports => {
+                "Ports view: use `ports`, `worktrees`, `download`, and port commands like `restart`, `kill`, and `move`."
+                    .to_string()
+            }
+            CockpitView::Worktrees => {
+                "Worktrees view: bare verbs work here, so `new feature-x`, `switch main`, `sync all --from main`, and `task test` are valid."
+                    .to_string()
+            }
+        },
+    }
+}
+
+fn strip_worktree_command_prefix(input: &str) -> Option<&str> {
+    ["wt", "worktree", "worktrees"]
+        .into_iter()
+        .find_map(|prefix| {
+            input.strip_prefix(prefix).and_then(|rest| {
+                let trimmed = rest.trim_start();
+                if trimmed.len() == rest.len() {
+                    None
+                } else {
+                    Some(trimmed)
+                }
+            })
+        })
+        .filter(|rest| !rest.is_empty())
+}
+
+fn is_bare_worktree_command(input: &str) -> bool {
+    let Some(command) = input.split_whitespace().next() else {
+        return false;
+    };
+
+    matches!(
+        command.to_ascii_lowercase().as_str(),
+        "add"
+            | "create"
+            | "new"
+            | "switch"
+            | "checkout"
+            | "co"
+            | "move"
+            | "mv"
+            | "lock"
+            | "unlock"
+            | "remove"
+            | "delete"
+            | "rm"
+            | "prune"
+            | "cleanup"
+            | "cherry-pick"
+            | "pick"
+            | "merge"
+            | "rebase"
+            | "reset"
+            | "continue"
+            | "cont"
+            | "abort"
+            | "sync"
+            | "task"
+            | "test"
+            | "lint"
+            | "build"
+    )
+}
+
+fn execute_pending_confirmation(state: &mut CockpitState) -> Result<()> {
+    let Some(pending) = state.pending_confirmation.take() else {
+        *state.active_message_mut() =
+            DashboardMessage::info("No action is waiting for confirmation.");
+        return Ok(());
+    };
+
+    match pending.action {
+        ConfirmableAction::RemoveWorktree { target, force } => {
+            let request = WorktreeRemoveRequest {
+                target: Some(target),
+                force,
+            };
+            perform_remove_worktree(state, &request)?;
+        }
+        ConfirmableAction::PruneWorktrees { dry_run } => {
+            perform_prune_worktrees(state, dry_run)?;
+        }
+        ConfirmableAction::CherryPickWorktree { target, commits } => {
+            let request = WorktreeCherryPickRequest {
+                commits,
+                target: Some(target),
+            };
+            perform_cherry_pick_worktree(state, &request)?;
+        }
+        ConfirmableAction::MergeWorktree { target, reference } => {
+            let request = WorktreeRefRequest {
+                reference,
+                target: Some(target),
+            };
+            perform_merge_worktree(state, &request)?;
+        }
+        ConfirmableAction::RebaseWorktree { target, reference } => {
+            let request = WorktreeRefRequest {
+                reference,
+                target: Some(target),
+            };
+            perform_rebase_worktree(state, &request)?;
+        }
+        ConfirmableAction::ResetWorktree {
+            target,
+            mode,
+            reference,
+        } => {
+            let request = WorktreeResetRequest {
+                mode,
+                reference,
+                target: Some(target),
+            };
+            perform_reset_worktree(state, &request)?;
+        }
+    }
+
+    Ok(())
+}
+
+fn refresh_active_view(state: &mut CockpitState, stale_after: Duration) -> Result<()> {
+    match state.view {
+        CockpitView::Ports => refresh_ports_view(state, stale_after),
+        CockpitView::Worktrees => refresh_worktrees_view(state),
+    }
+}
+
+fn refresh_ports_view(state: &mut CockpitState, stale_after: Duration) -> Result<()> {
+    let snapshot = refresh_snapshot(stale_after)?;
+    state.ports.apply_snapshot(snapshot);
+    probe_visible_rows(&mut state.ports, Duration::from_millis(180))?;
+    state.ports.rebuild_rows(None);
+    Ok(())
+}
+
+fn refresh_worktrees_view(state: &mut CockpitState) -> Result<()> {
+    let preferred = state
+        .worktrees
+        .selected_row()
+        .map(|row| row.worktree.path.display().to_string());
+    state.worktrees.apply_repo(discover_current_repo()?);
+    state.worktrees.rebuild_rows(preferred.as_deref());
+    Ok(())
+}
+
+fn switch_view(state: &mut CockpitState, view: CockpitView, stale_after: Duration) -> Result<()> {
+    if state.view == view {
+        return Ok(());
+    }
+    state.view = view;
+    match view {
+        CockpitView::Ports => {
+            probe_visible_rows(&mut state.ports, Duration::from_millis(180))?;
+            state.ports.rebuild_rows(None);
+            state.ports.message = DashboardMessage::info("Switched to Ports view.");
+        }
+        CockpitView::Worktrees => {
+            refresh_worktrees_view(state)?;
+            state.worktrees.message = DashboardMessage::info("Switched to Worktrees view.");
+        }
+    }
+    if matches!(view, CockpitView::Ports) {
+        let _ = stale_after;
+    }
+    Ok(())
+}
+
+fn next_view(view: CockpitView) -> CockpitView {
+    match view {
+        CockpitView::Ports => CockpitView::Worktrees,
+        CockpitView::Worktrees => CockpitView::Ports,
+    }
+}
+
+fn previous_view(view: CockpitView) -> CockpitView {
+    next_view(view)
+}
+
+fn parse_download_target(input: &str) -> Result<Option<String>> {
+    let mut parts = input.split_whitespace();
+    let Some(command) = parts.next() else {
+        return Ok(None);
+    };
+    if !matches!(command, "download" | "export" | "d") {
+        bail!("usage: download [file]");
+    }
+    Ok(parts.next().map(str::to_string))
 }
 
 fn execute_dashboard_command(
@@ -1631,7 +2708,8 @@ fn execute_dashboard_command(
         DashboardCommand::Download(path) => {
             let snapshot = refresh_snapshot(args.stale_after)?;
             let path = resolve_export_path(path.as_deref())?;
-            export_dashboard_snapshot(&snapshot, args.stale_after, &path)?;
+            let repo = discover_current_repo()?;
+            export_dashboard_snapshot(&snapshot, repo.as_ref(), args.stale_after, &path)?;
             state.apply_snapshot(snapshot);
             state.message = DashboardMessage::success(format!("Wrote {}", path.display()));
         }
@@ -1811,6 +2889,1355 @@ fn parse_quick_command(rest: &str) -> Result<DashboardCommand> {
         "old" | "kill-old" => Ok(DashboardCommand::Quick(QuickAction::KillOld)),
         "restart-old" => Ok(DashboardCommand::Quick(QuickAction::RestartOld)),
         _ => bail!("usage: quick <stale|old|restart-old>"),
+    }
+}
+
+fn execute_worktree_view_command(input: &str, state: &mut CockpitState) -> Result<bool> {
+    let trimmed = input.trim();
+    let mut parts = trimmed.split_whitespace();
+    let Some(command) = parts.next() else {
+        return Ok(false);
+    };
+    let rest = trimmed
+        .find(char::is_whitespace)
+        .map(|index| trimmed[index..].trim())
+        .unwrap_or("");
+
+    match command.to_ascii_lowercase().as_str() {
+        "filter" | "f" => {
+            if rest.is_empty() {
+                bail!("usage: filter <expr>");
+            }
+            let parsed = WorktreeFilter::parse(rest)?;
+            state.worktrees.filter = Some(parsed.clone());
+            state.worktrees.rebuild_rows(None);
+            *state.active_message_mut() =
+                DashboardMessage::success(format!("Filter set to `{}`.", parsed.label()));
+        }
+        "sort" => {
+            let sort = parse_worktree_sort(rest)?;
+            state.worktrees.sort = sort;
+            state.worktrees.rebuild_rows(None);
+            *state.active_message_mut() =
+                DashboardMessage::success(format!("Sort set to {}.", sort.label()));
+        }
+        "clear" => {
+            state.worktrees.filter = None;
+            state.worktrees.sort = WorktreeSort::default();
+            state.worktrees.rebuild_rows(None);
+            *state.active_message_mut() = DashboardMessage::success("Cleared filter and sort.");
+        }
+        "select" | "s" => {
+            let target = parts
+                .next()
+                .ok_or_else(|| anyhow!("usage: select <path-or-branch>"))?;
+            execute_select_worktree_command(target, state)?;
+        }
+        "open" | "browse" => {
+            execute_open_worktree_command(parts.next(), state)?;
+        }
+        other => bail!(
+            "unknown worktree command `{other}`. try bare verbs like `add`/`remove`, `worktree ...`, or `help worktrees`"
+        ),
+    }
+
+    Ok(false)
+}
+
+fn execute_worktree_command(input: &str, state: &mut CockpitState) -> Result<()> {
+    match parse_worktree_command(input, &state.worktrees)? {
+        WorktreeCommand::Add(request) => perform_add_worktree(state, &request),
+        WorktreeCommand::Open(target) => execute_open_worktree_command(target.as_deref(), state),
+        WorktreeCommand::Switch(request) => perform_switch_worktree(state, &request),
+        WorktreeCommand::Move(request) => perform_move_worktree(state, &request),
+        WorktreeCommand::Lock(request) => perform_lock_worktree(state, &request),
+        WorktreeCommand::Unlock(target) => perform_unlock_worktree(state, target.as_deref()),
+        WorktreeCommand::Remove(request) => queue_remove_worktree(state, &request),
+        WorktreeCommand::Prune { dry_run } => {
+            state.pending_confirmation = Some(PendingConfirmation {
+                prompt: if dry_run {
+                    "Run `git worktree prune --dry-run`?".to_string()
+                } else {
+                    "Prune stale git worktree metadata?".to_string()
+                },
+                action: ConfirmableAction::PruneWorktrees { dry_run },
+            });
+            *state.active_message_mut() =
+                DashboardMessage::info("Pending confirmation. Type `yes` or `no`.");
+            Ok(())
+        }
+        WorktreeCommand::CherryPick(request) => queue_cherry_pick_worktree(state, &request),
+        WorktreeCommand::Merge(request) => queue_merge_worktree(state, &request),
+        WorktreeCommand::Rebase(request) => queue_rebase_worktree(state, &request),
+        WorktreeCommand::Reset(request) => queue_reset_worktree(state, &request),
+        WorktreeCommand::Continue(target) => perform_continue_worktree(state, target.as_deref()),
+        WorktreeCommand::Abort(target) => perform_abort_worktree(state, target.as_deref()),
+        WorktreeCommand::Sync(request) => perform_sync_worktrees(state, &request),
+        WorktreeCommand::Task(request) => perform_worktree_task(state, &request),
+    }
+}
+
+fn parse_worktree_command(input: &str, state: &WorktreeDashboardState) -> Result<WorktreeCommand> {
+    let tokens: Vec<String> = input.split_whitespace().map(ToOwned::to_owned).collect();
+    let Some(command) = tokens.first().map(|token| token.to_ascii_lowercase()) else {
+        bail!("usage: wt <action> ...");
+    };
+
+    match command.as_str() {
+        "add" | "create" => parse_worktree_add(&tokens[1..], false),
+        "new" => parse_worktree_add(&tokens[1..], true),
+        "open" => Ok(WorktreeCommand::Open(tokens.get(1).cloned())),
+        "switch" | "checkout" | "co" => parse_worktree_switch(&tokens[1..]),
+        "move" | "mv" => parse_worktree_move(&tokens[1..]),
+        "lock" => parse_worktree_lock(&tokens[1..]),
+        "unlock" => Ok(WorktreeCommand::Unlock(tokens.get(1).cloned())),
+        "remove" | "delete" | "rm" => parse_worktree_remove(&tokens[1..]),
+        "prune" | "cleanup" => parse_worktree_prune(&tokens[1..]),
+        "cherry-pick" | "pick" => parse_worktree_cherry_pick(&tokens[1..], state),
+        "merge" => parse_worktree_ref_command("merge", &tokens[1..]).map(WorktreeCommand::Merge),
+        "rebase" => parse_worktree_ref_command("rebase", &tokens[1..]).map(WorktreeCommand::Rebase),
+        "reset" => parse_worktree_reset(&tokens[1..]),
+        "continue" | "cont" => Ok(WorktreeCommand::Continue(tokens.get(1).cloned())),
+        "abort" => Ok(WorktreeCommand::Abort(tokens.get(1).cloned())),
+        "sync" => parse_worktree_sync(&tokens[1..]),
+        "task" => parse_worktree_task(&tokens[1..]),
+        "test" => parse_worktree_task_alias(WorktreeTaskPreset::Test, &tokens[1..]),
+        "lint" => parse_worktree_task_alias(WorktreeTaskPreset::Lint, &tokens[1..]),
+        "build" => parse_worktree_task_alias(WorktreeTaskPreset::Build, &tokens[1..]),
+        other => bail!("unknown worktree action `{other}`"),
+    }
+}
+
+fn parse_worktree_add(tokens: &[String], derive_from_name: bool) -> Result<WorktreeCommand> {
+    let Some(name_or_path) = tokens.first() else {
+        bail!(
+            "usage: add <path> [--branch <name>] [--from <ref>] [--detach] [--no-checkout] [--lock]"
+        );
+    };
+
+    let mut request = WorktreeAddRequest {
+        path: name_or_path.clone(),
+        branch: None,
+        from_ref: None,
+        detach: false,
+        no_checkout: false,
+        lock: false,
+        implicit_path_from_branch: false,
+    };
+    let mut index = 1usize;
+    while index < tokens.len() {
+        match tokens[index].as_str() {
+            "--branch" => {
+                request.branch = Some(
+                    tokens
+                        .get(index + 1)
+                        .ok_or_else(|| anyhow!("missing value for --branch"))?
+                        .clone(),
+                );
+                index += 2;
+            }
+            "--from" => {
+                request.from_ref = Some(
+                    tokens
+                        .get(index + 1)
+                        .ok_or_else(|| anyhow!("missing value for --from"))?
+                        .clone(),
+                );
+                index += 2;
+            }
+            "--detach" => {
+                request.detach = true;
+                index += 1;
+            }
+            "--no-checkout" => {
+                request.no_checkout = true;
+                index += 1;
+            }
+            "--lock" => {
+                request.lock = true;
+                index += 1;
+            }
+            other => bail!("unknown wt add flag `{other}`"),
+        }
+    }
+
+    if derive_from_name && request.branch.is_none() {
+        request.branch = Some(name_or_path.clone());
+        request.path = default_new_worktree_path(name_or_path);
+        request.implicit_path_from_branch = true;
+    }
+    Ok(WorktreeCommand::Add(request))
+}
+
+fn default_new_worktree_path(branch_name: &str) -> String {
+    format!("../{}", sanitize_branch_name_for_path(branch_name))
+}
+
+fn sanitize_branch_name_for_path(branch_name: &str) -> String {
+    let mut sanitized = String::with_capacity(branch_name.len());
+    for ch in branch_name.chars() {
+        if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.') {
+            sanitized.push(ch);
+        } else {
+            sanitized.push('-');
+        }
+    }
+    let sanitized = sanitized.trim_matches('-').trim_matches('.');
+    if sanitized.is_empty() {
+        "worktree".to_string()
+    } else {
+        sanitized.to_string()
+    }
+}
+
+fn resolve_new_worktree_path(repo_root: &Path, value: &str) -> PathBuf {
+    let path = PathBuf::from(value);
+    if path.is_absolute() {
+        path
+    } else {
+        repo_root.join(path)
+    }
+}
+
+fn parse_worktree_switch(tokens: &[String]) -> Result<WorktreeCommand> {
+    let Some(reference) = tokens.first() else {
+        bail!("usage: wt switch <ref> [target] [--create] [--track]");
+    };
+    let mut request = WorktreeSwitchRequest {
+        reference: reference.clone(),
+        target: None,
+        create: false,
+        track: false,
+    };
+    let mut index = 1usize;
+    while index < tokens.len() {
+        match tokens[index].as_str() {
+            "--create" => {
+                request.create = true;
+                index += 1;
+            }
+            "--track" => {
+                request.track = true;
+                index += 1;
+            }
+            token => {
+                if request.target.is_some() {
+                    bail!("usage: wt switch <ref> [target] [--create] [--track]");
+                }
+                request.target = Some(token.to_string());
+                index += 1;
+            }
+        }
+    }
+    Ok(WorktreeCommand::Switch(request))
+}
+
+fn parse_worktree_move(tokens: &[String]) -> Result<WorktreeCommand> {
+    let Some(new_path) = tokens.first() else {
+        bail!("usage: wt move <new-path> [target]");
+    };
+    let request = WorktreeMoveRequest {
+        new_path: new_path.clone(),
+        target: tokens.get(1).cloned(),
+    };
+    if tokens.len() > 2 {
+        bail!("usage: wt move <new-path> [target]");
+    }
+    Ok(WorktreeCommand::Move(request))
+}
+
+fn parse_worktree_lock(tokens: &[String]) -> Result<WorktreeCommand> {
+    let mut request = WorktreeLockRequest {
+        target: None,
+        reason: None,
+    };
+    let mut index = 0usize;
+    while index < tokens.len() {
+        match tokens[index].as_str() {
+            "--reason" => {
+                let reason = tokens
+                    .get(index + 1..)
+                    .ok_or_else(|| anyhow!("missing value for --reason"))?;
+                if reason.is_empty() {
+                    bail!("missing value for --reason");
+                }
+                request.reason = Some(reason.join(" "));
+                break;
+            }
+            token => {
+                if request.target.is_some() {
+                    bail!("usage: wt lock [target] [--reason <text>]");
+                }
+                request.target = Some(token.to_string());
+                index += 1;
+            }
+        }
+    }
+    Ok(WorktreeCommand::Lock(request))
+}
+
+fn parse_worktree_remove(tokens: &[String]) -> Result<WorktreeCommand> {
+    let mut request = WorktreeRemoveRequest {
+        target: None,
+        force: false,
+    };
+    for token in tokens {
+        match token.as_str() {
+            "--force" => request.force = true,
+            other => {
+                if request.target.is_some() {
+                    bail!("usage: wt remove [target] [--force]");
+                }
+                request.target = Some(other.to_string());
+            }
+        }
+    }
+    Ok(WorktreeCommand::Remove(request))
+}
+
+fn parse_worktree_prune(tokens: &[String]) -> Result<WorktreeCommand> {
+    let mut dry_run = false;
+    for token in tokens {
+        match token.as_str() {
+            "--dry-run" | "-n" => dry_run = true,
+            other => bail!("unknown wt prune flag `{other}`"),
+        }
+    }
+    Ok(WorktreeCommand::Prune { dry_run })
+}
+
+fn parse_worktree_cherry_pick(
+    tokens: &[String],
+    state: &WorktreeDashboardState,
+) -> Result<WorktreeCommand> {
+    if tokens.is_empty() {
+        bail!("usage: wt cherry-pick <commit-ish...> [target]");
+    }
+    let mut commits = tokens.to_vec();
+    let mut target = None;
+    if commits.len() > 1 {
+        if let Some(candidate) = commits.last() {
+            if worktree_target_matches(state, candidate) {
+                target = Some(candidate.clone());
+                commits.pop();
+            }
+        }
+    }
+    if commits.is_empty() {
+        bail!("wt cherry-pick requires at least one commit-ish");
+    }
+    Ok(WorktreeCommand::CherryPick(WorktreeCherryPickRequest {
+        commits,
+        target,
+    }))
+}
+
+fn parse_worktree_ref_command(name: &str, tokens: &[String]) -> Result<WorktreeRefRequest> {
+    let Some(reference) = tokens.first() else {
+        bail!("usage: wt {name} <ref> [target]");
+    };
+    if tokens.len() > 2 {
+        bail!("usage: wt {name} <ref> [target]");
+    }
+    Ok(WorktreeRefRequest {
+        reference: reference.clone(),
+        target: tokens.get(1).cloned(),
+    })
+}
+
+fn parse_worktree_reset(tokens: &[String]) -> Result<WorktreeCommand> {
+    if tokens.len() < 2 || tokens.len() > 3 {
+        bail!("usage: wt reset <--soft|--mixed|--hard> <ref> [target]");
+    }
+    let mode = match tokens[0].as_str() {
+        "--soft" => ResetMode::Soft,
+        "--mixed" => ResetMode::Mixed,
+        "--hard" => ResetMode::Hard,
+        other => bail!("unknown reset mode `{other}`"),
+    };
+    Ok(WorktreeCommand::Reset(WorktreeResetRequest {
+        mode,
+        reference: tokens[1].clone(),
+        target: tokens.get(2).cloned(),
+    }))
+}
+
+fn parse_worktree_sync(tokens: &[String]) -> Result<WorktreeCommand> {
+    let mut request = WorktreeSyncRequest {
+        target: None,
+        from_ref: None,
+        mode: WorktreeSyncMode::Rebase,
+        all: false,
+        include_dirty: false,
+        include_main: false,
+    };
+
+    let mut index = 0usize;
+    while index < tokens.len() {
+        match tokens[index].as_str() {
+            "all" | "--all" => {
+                if request.target.is_some() {
+                    bail!(
+                        "usage: wt sync [all|target] [--from ref] [--mode rebase|merge] [--include-dirty] [--include-main]"
+                    );
+                }
+                request.all = true;
+                index += 1;
+            }
+            "--from" => {
+                request.from_ref = Some(
+                    tokens
+                        .get(index + 1)
+                        .ok_or_else(|| anyhow!("missing value for --from"))?
+                        .clone(),
+                );
+                index += 2;
+            }
+            "--mode" => {
+                let value = tokens
+                    .get(index + 1)
+                    .ok_or_else(|| anyhow!("missing value for --mode"))?;
+                request.mode = WorktreeSyncMode::parse(value)?;
+                index += 2;
+            }
+            "--merge" => {
+                request.mode = WorktreeSyncMode::Merge;
+                index += 1;
+            }
+            "--rebase" => {
+                request.mode = WorktreeSyncMode::Rebase;
+                index += 1;
+            }
+            "--include-dirty" => {
+                request.include_dirty = true;
+                index += 1;
+            }
+            "--include-main" => {
+                request.include_main = true;
+                index += 1;
+            }
+            token => {
+                if request.target.is_some() || request.all {
+                    bail!(
+                        "usage: wt sync [all|target] [--from ref] [--mode rebase|merge] [--include-dirty] [--include-main]"
+                    );
+                }
+                request.target = Some(token.to_string());
+                index += 1;
+            }
+        }
+    }
+
+    Ok(WorktreeCommand::Sync(request))
+}
+
+fn parse_worktree_task(tokens: &[String]) -> Result<WorktreeCommand> {
+    let Some(preset_raw) = tokens.first() else {
+        bail!("usage: wt task <test|lint|build> [target]");
+    };
+    let preset = WorktreeTaskPreset::parse(preset_raw)?;
+    parse_worktree_task_alias(preset, &tokens[1..])
+}
+
+fn parse_worktree_task_alias(
+    preset: WorktreeTaskPreset,
+    tokens: &[String],
+) -> Result<WorktreeCommand> {
+    if tokens.len() > 1 {
+        bail!("usage: wt {} [target]", preset.label());
+    }
+    Ok(WorktreeCommand::Task(WorktreeTaskRequest {
+        preset,
+        target: tokens.first().cloned(),
+    }))
+}
+
+fn parse_worktree_sort(rest: &str) -> Result<WorktreeSort> {
+    let tokens: Vec<_> = rest.split_whitespace().collect();
+    let Some(key_token) = tokens.first() else {
+        bail!("usage: sort <path|branch|sync|changes|state|stale> [asc|desc]");
+    };
+    let key = match key_token.to_ascii_lowercase().as_str() {
+        "path" => WorktreeSortKey::Path,
+        "branch" => WorktreeSortKey::Branch,
+        "sync" => WorktreeSortKey::Sync,
+        "changes" => WorktreeSortKey::Changes,
+        "state" => WorktreeSortKey::State,
+        "stale" => WorktreeSortKey::Stale,
+        other => bail!("unknown sort key `{other}`"),
+    };
+    let direction = match tokens.get(1).map(|value| value.to_ascii_lowercase()) {
+        None => SortDirection::Asc,
+        Some(value) if value == "asc" => SortDirection::Asc,
+        Some(value) if value == "desc" => SortDirection::Desc,
+        Some(value) => bail!("unknown sort direction `{}`", value),
+    };
+    Ok(WorktreeSort { key, direction })
+}
+
+fn execute_select_worktree_command(target: &str, state: &mut CockpitState) -> Result<()> {
+    let row = resolve_worktree_target(&state.worktrees, Some(target))?;
+    if let Some(index) = state
+        .worktrees
+        .rows
+        .iter()
+        .position(|candidate| candidate.key() == row.key())
+    {
+        state.worktrees.selected = index;
+    }
+    *state.active_message_mut() =
+        DashboardMessage::info(format!("Selected {}.", display_path(&row.worktree.path)));
+    Ok(())
+}
+
+fn execute_open_worktree_command(target: Option<&str>, state: &mut CockpitState) -> Result<()> {
+    let row = resolve_worktree_target(&state.worktrees, target)?;
+    open_path(&row.worktree.path)?;
+    *state.active_message_mut() =
+        DashboardMessage::success(format!("Opened {}.", display_path(&row.worktree.path)));
+    Ok(())
+}
+
+fn queue_remove_worktree(state: &mut CockpitState, request: &WorktreeRemoveRequest) -> Result<()> {
+    let row = resolve_worktree_target(&state.worktrees, request.target.as_deref())?;
+    if row.worktree.is_main {
+        bail!("cannot remove the main worktree");
+    }
+    let safety_risks = worktree_remove_safety_risks(&row.worktree);
+    if !safety_risks.is_empty() && !request.force {
+        bail!(
+            "remove blocked: {}. rerun with `--force` to acknowledge risk",
+            safety_risks.join(", ")
+        );
+    }
+    let risk_note = if safety_risks.is_empty() {
+        String::new()
+    } else {
+        format!(" Risks: {}.", safety_risks.join(", "))
+    };
+    state.pending_confirmation = Some(PendingConfirmation {
+        prompt: format!(
+            "Remove worktree {}?{}",
+            display_path(&row.worktree.path),
+            risk_note
+        ),
+        action: ConfirmableAction::RemoveWorktree {
+            target: row.worktree.path.display().to_string(),
+            force: request.force,
+        },
+    });
+    *state.active_message_mut() =
+        DashboardMessage::info("Pending confirmation. Type `yes` or `no`.");
+    Ok(())
+}
+
+fn worktree_remove_safety_risks(worktree: &WorktreeRecord) -> Vec<String> {
+    let mut risks = Vec::new();
+    if worktree.locked {
+        risks.push("locked".to_string());
+    }
+    if worktree.is_dirty() {
+        risks.push(format!("dirty:{} files", worktree.change_count()));
+    }
+    if !worktree.operations.is_empty() {
+        let operations = worktree
+            .operations
+            .iter()
+            .map(|op| op.label())
+            .collect::<Vec<_>>()
+            .join("+");
+        risks.push(format!("in-progress:{operations}"));
+    }
+    if let Some(unpushed) = worktree.unpushed_count() {
+        if unpushed > 0 {
+            risks.push(format!("unpushed:{unpushed}"));
+        }
+    }
+    if matches!(worktree.merged_into_base, Some(false)) {
+        risks.push(format!(
+            "unmerged:{}",
+            worktree.base_ref.as_deref().unwrap_or("base")
+        ));
+    }
+    risks
+}
+
+fn queue_cherry_pick_worktree(
+    state: &mut CockpitState,
+    request: &WorktreeCherryPickRequest,
+) -> Result<()> {
+    let row = resolve_worktree_target(&state.worktrees, request.target.as_deref())?;
+    state.pending_confirmation = Some(PendingConfirmation {
+        prompt: format!(
+            "Cherry-pick {} into {}?",
+            request.commits.join(" "),
+            display_path(&row.worktree.path)
+        ),
+        action: ConfirmableAction::CherryPickWorktree {
+            target: row.worktree.path.display().to_string(),
+            commits: request.commits.clone(),
+        },
+    });
+    *state.active_message_mut() =
+        DashboardMessage::info("Pending confirmation. Type `yes` or `no`.");
+    Ok(())
+}
+
+fn queue_merge_worktree(state: &mut CockpitState, request: &WorktreeRefRequest) -> Result<()> {
+    let row = resolve_worktree_target(&state.worktrees, request.target.as_deref())?;
+    state.pending_confirmation = Some(PendingConfirmation {
+        prompt: format!(
+            "Merge {} into {}?",
+            request.reference,
+            display_path(&row.worktree.path)
+        ),
+        action: ConfirmableAction::MergeWorktree {
+            target: row.worktree.path.display().to_string(),
+            reference: request.reference.clone(),
+        },
+    });
+    *state.active_message_mut() =
+        DashboardMessage::info("Pending confirmation. Type `yes` or `no`.");
+    Ok(())
+}
+
+fn queue_rebase_worktree(state: &mut CockpitState, request: &WorktreeRefRequest) -> Result<()> {
+    let row = resolve_worktree_target(&state.worktrees, request.target.as_deref())?;
+    state.pending_confirmation = Some(PendingConfirmation {
+        prompt: format!(
+            "Rebase {} onto {}?",
+            display_path(&row.worktree.path),
+            request.reference
+        ),
+        action: ConfirmableAction::RebaseWorktree {
+            target: row.worktree.path.display().to_string(),
+            reference: request.reference.clone(),
+        },
+    });
+    *state.active_message_mut() =
+        DashboardMessage::info("Pending confirmation. Type `yes` or `no`.");
+    Ok(())
+}
+
+fn queue_reset_worktree(state: &mut CockpitState, request: &WorktreeResetRequest) -> Result<()> {
+    let row = resolve_worktree_target(&state.worktrees, request.target.as_deref())?;
+    state.pending_confirmation = Some(PendingConfirmation {
+        prompt: format!(
+            "Reset {} to {} ({})?",
+            display_path(&row.worktree.path),
+            request.reference,
+            request.mode.label()
+        ),
+        action: ConfirmableAction::ResetWorktree {
+            target: row.worktree.path.display().to_string(),
+            mode: request.mode,
+            reference: request.reference.clone(),
+        },
+    });
+    *state.active_message_mut() =
+        DashboardMessage::info("Pending confirmation. Type `yes` or `no`.");
+    Ok(())
+}
+
+fn perform_add_worktree(state: &mut CockpitState, request: &WorktreeAddRequest) -> Result<()> {
+    let repo = require_repo_snapshot(state)?;
+    let target_path = resolve_new_worktree_path(&repo.root, &request.path);
+    let mut args = vec!["worktree".to_string(), "add".to_string()];
+    if let Some(branch) = request.branch.as_ref() {
+        args.push("-b".to_string());
+        args.push(branch.clone());
+    }
+    if request.detach {
+        args.push("--detach".to_string());
+    }
+    if request.no_checkout {
+        args.push("--no-checkout".to_string());
+    }
+    if request.lock {
+        args.push("--lock".to_string());
+    }
+    args.push(target_path.display().to_string());
+    if let Some(from_ref) = request.from_ref.as_ref() {
+        args.push(from_ref.clone());
+    }
+    run_git(&repo.root, &args)?;
+    let target_display = target_path.display().to_string();
+    refresh_worktrees_with_selection(state, Some(&target_display))?;
+    *state.active_message_mut() = if request.implicit_path_from_branch {
+        DashboardMessage::success(format!(
+            "Added worktree {} for branch {}.",
+            display_path(&target_path),
+            request.branch.as_deref().unwrap_or("unknown")
+        ))
+    } else {
+        DashboardMessage::success(format!("Added worktree {}.", display_path(&target_path)))
+    };
+    Ok(())
+}
+
+fn perform_switch_worktree(
+    state: &mut CockpitState,
+    request: &WorktreeSwitchRequest,
+) -> Result<()> {
+    let row = resolve_worktree_target(&state.worktrees, request.target.as_deref())?;
+    let mut args = vec!["switch".to_string()];
+    if request.create {
+        args.push("--create".to_string());
+    }
+    if request.track {
+        args.push("--track".to_string());
+    }
+    args.push(request.reference.clone());
+    run_git(&row.worktree.path, &args)?;
+    refresh_worktrees_with_selection(state, Some(&row.worktree.path.display().to_string()))?;
+    *state.active_message_mut() = DashboardMessage::success(format!(
+        "Switched {} to {}.",
+        display_path(&row.worktree.path),
+        request.reference
+    ));
+    Ok(())
+}
+
+fn perform_move_worktree(state: &mut CockpitState, request: &WorktreeMoveRequest) -> Result<()> {
+    let repo = require_repo_snapshot(state)?;
+    let row = resolve_worktree_target(&state.worktrees, request.target.as_deref())?;
+    let args = vec![
+        "worktree".to_string(),
+        "move".to_string(),
+        row.worktree.path.display().to_string(),
+        request.new_path.clone(),
+    ];
+    run_git(&repo.root, &args)?;
+    refresh_worktrees_with_selection(state, Some(&request.new_path))?;
+    *state.active_message_mut() = DashboardMessage::success(format!(
+        "Moved {} to {}.",
+        display_path(&row.worktree.path),
+        request.new_path
+    ));
+    Ok(())
+}
+
+fn perform_lock_worktree(state: &mut CockpitState, request: &WorktreeLockRequest) -> Result<()> {
+    let repo = require_repo_snapshot(state)?;
+    let row = resolve_worktree_target(&state.worktrees, request.target.as_deref())?;
+    let mut args = vec!["worktree".to_string(), "lock".to_string()];
+    if let Some(reason) = request.reason.as_ref() {
+        args.push("--reason".to_string());
+        args.push(reason.clone());
+    }
+    args.push(row.worktree.path.display().to_string());
+    run_git(&repo.root, &args)?;
+    refresh_worktrees_with_selection(state, Some(&row.worktree.path.display().to_string()))?;
+    *state.active_message_mut() =
+        DashboardMessage::success(format!("Locked {}.", display_path(&row.worktree.path)));
+    Ok(())
+}
+
+fn perform_unlock_worktree(state: &mut CockpitState, target: Option<&str>) -> Result<()> {
+    let repo = require_repo_snapshot(state)?;
+    let row = resolve_worktree_target(&state.worktrees, target)?;
+    let args = vec![
+        "worktree".to_string(),
+        "unlock".to_string(),
+        row.worktree.path.display().to_string(),
+    ];
+    run_git(&repo.root, &args)?;
+    refresh_worktrees_with_selection(state, Some(&row.worktree.path.display().to_string()))?;
+    *state.active_message_mut() =
+        DashboardMessage::success(format!("Unlocked {}.", display_path(&row.worktree.path)));
+    Ok(())
+}
+
+fn perform_remove_worktree(
+    state: &mut CockpitState,
+    request: &WorktreeRemoveRequest,
+) -> Result<()> {
+    let repo = require_repo_snapshot(state)?;
+    let row = resolve_worktree_target(&state.worktrees, request.target.as_deref())?;
+    if row.worktree.is_main {
+        bail!("cannot remove the main worktree");
+    }
+    let safety_risks = worktree_remove_safety_risks(&row.worktree);
+    if !safety_risks.is_empty() && !request.force {
+        bail!(
+            "remove blocked: {}. rerun with `--force`",
+            safety_risks.join(", ")
+        );
+    }
+    let mut args = vec!["worktree".to_string(), "remove".to_string()];
+    if request.force {
+        args.push("--force".to_string());
+        if row.worktree.locked {
+            args.push("--force".to_string());
+        }
+    }
+    args.push(row.worktree.path.display().to_string());
+    run_git(&repo.root, &args)?;
+    refresh_worktrees_with_selection(state, None)?;
+    *state.active_message_mut() =
+        DashboardMessage::success(format!("Removed {}.", display_path(&row.worktree.path)));
+    Ok(())
+}
+
+fn perform_prune_worktrees(state: &mut CockpitState, dry_run: bool) -> Result<()> {
+    let repo = require_repo_snapshot(state)?;
+    let mut args = vec!["worktree".to_string(), "prune".to_string()];
+    if dry_run {
+        args.push("--dry-run".to_string());
+    }
+    run_git(&repo.root, &args)?;
+    refresh_worktrees_with_selection(state, None)?;
+    *state.active_message_mut() = DashboardMessage::success(if dry_run {
+        "Ran git worktree prune --dry-run."
+    } else {
+        "Pruned stale git worktree metadata."
+    });
+    Ok(())
+}
+
+fn perform_cherry_pick_worktree(
+    state: &mut CockpitState,
+    request: &WorktreeCherryPickRequest,
+) -> Result<()> {
+    let row = resolve_worktree_target(&state.worktrees, request.target.as_deref())?;
+    let mut args = vec!["cherry-pick".to_string()];
+    args.extend(request.commits.iter().cloned());
+    run_git(&row.worktree.path, &args)?;
+    refresh_worktrees_with_selection(state, Some(&row.worktree.path.display().to_string()))?;
+    *state.active_message_mut() = DashboardMessage::success(format!(
+        "Cherry-picked into {}.",
+        display_path(&row.worktree.path)
+    ));
+    Ok(())
+}
+
+fn perform_merge_worktree(state: &mut CockpitState, request: &WorktreeRefRequest) -> Result<()> {
+    let row = resolve_worktree_target(&state.worktrees, request.target.as_deref())?;
+    let args = vec!["merge".to_string(), request.reference.clone()];
+    run_git(&row.worktree.path, &args)?;
+    refresh_worktrees_with_selection(state, Some(&row.worktree.path.display().to_string()))?;
+    *state.active_message_mut() = DashboardMessage::success(format!(
+        "Merged {} into {}.",
+        request.reference,
+        display_path(&row.worktree.path)
+    ));
+    Ok(())
+}
+
+fn perform_rebase_worktree(state: &mut CockpitState, request: &WorktreeRefRequest) -> Result<()> {
+    let row = resolve_worktree_target(&state.worktrees, request.target.as_deref())?;
+    let args = vec!["rebase".to_string(), request.reference.clone()];
+    run_git(&row.worktree.path, &args)?;
+    refresh_worktrees_with_selection(state, Some(&row.worktree.path.display().to_string()))?;
+    *state.active_message_mut() = DashboardMessage::success(format!(
+        "Rebased {} onto {}.",
+        display_path(&row.worktree.path),
+        request.reference
+    ));
+    Ok(())
+}
+
+fn perform_reset_worktree(state: &mut CockpitState, request: &WorktreeResetRequest) -> Result<()> {
+    let row = resolve_worktree_target(&state.worktrees, request.target.as_deref())?;
+    let args = vec![
+        "reset".to_string(),
+        request.mode.flag().to_string(),
+        request.reference.clone(),
+    ];
+    run_git(&row.worktree.path, &args)?;
+    refresh_worktrees_with_selection(state, Some(&row.worktree.path.display().to_string()))?;
+    *state.active_message_mut() = DashboardMessage::success(format!(
+        "Reset {} to {} ({}).",
+        display_path(&row.worktree.path),
+        request.reference,
+        request.mode.label()
+    ));
+    Ok(())
+}
+
+fn perform_continue_worktree(state: &mut CockpitState, target: Option<&str>) -> Result<()> {
+    let row = resolve_worktree_target(&state.worktrees, target)?;
+    let operation = active_operation(&row.worktree)
+        .ok_or_else(|| anyhow!("no single in-progress operation to continue"))?;
+    let args = args_for_worktree_resume(operation, true);
+    run_git(&row.worktree.path, &args)?;
+    refresh_worktrees_with_selection(state, Some(&row.worktree.path.display().to_string()))?;
+    *state.active_message_mut() = DashboardMessage::success(format!(
+        "Continued {} in {}.",
+        operation.label(),
+        display_path(&row.worktree.path)
+    ));
+    Ok(())
+}
+
+fn perform_abort_worktree(state: &mut CockpitState, target: Option<&str>) -> Result<()> {
+    let row = resolve_worktree_target(&state.worktrees, target)?;
+    let operation = active_operation(&row.worktree)
+        .ok_or_else(|| anyhow!("no single in-progress operation to abort"))?;
+    let args = args_for_worktree_resume(operation, false);
+    run_git(&row.worktree.path, &args)?;
+    refresh_worktrees_with_selection(state, Some(&row.worktree.path.display().to_string()))?;
+    *state.active_message_mut() = DashboardMessage::success(format!(
+        "Aborted {} in {}.",
+        operation.label(),
+        display_path(&row.worktree.path)
+    ));
+    Ok(())
+}
+
+#[derive(Debug, Default)]
+struct WorktreeSyncSummary {
+    updated: Vec<String>,
+    skipped: Vec<(String, String)>,
+    failed: Vec<(String, String)>,
+}
+
+#[derive(Debug, Clone)]
+struct CommandRunResult {
+    success: bool,
+    exit_code: i32,
+    duration: Duration,
+    output_tail: Vec<String>,
+}
+
+fn perform_sync_worktrees(state: &mut CockpitState, request: &WorktreeSyncRequest) -> Result<()> {
+    let repo = require_repo_snapshot(state)?;
+    let from_ref = request
+        .from_ref
+        .clone()
+        .or_else(|| repo.base_ref.clone())
+        .unwrap_or_else(|| "main".to_string());
+    let preferred = state.worktrees.selected_key();
+
+    let rows = if request.all {
+        state.worktrees.all_rows.clone()
+    } else {
+        vec![resolve_worktree_target(
+            &state.worktrees,
+            request.target.as_deref(),
+        )?]
+    };
+    if rows.is_empty() {
+        bail!("no worktrees are available to sync");
+    }
+
+    let mut summary = WorktreeSyncSummary::default();
+    for row in rows {
+        let label = display_path(&row.worktree.path);
+        if !request.include_main && row.worktree.is_main {
+            summary.skipped.push((label, "main".to_string()));
+            continue;
+        }
+        if row.worktree.has_in_progress_operation() {
+            let ops = row
+                .worktree
+                .operations
+                .iter()
+                .map(|operation| operation.label())
+                .collect::<Vec<_>>()
+                .join("+");
+            summary.skipped.push((label, format!("in-progress:{ops}")));
+            continue;
+        }
+        if !request.include_dirty && row.worktree.is_dirty() {
+            summary.skipped.push((label, "dirty".to_string()));
+            continue;
+        }
+        if row.worktree.prunable {
+            summary.skipped.push((label, "prunable".to_string()));
+            continue;
+        }
+
+        let args = match request.mode {
+            WorktreeSyncMode::Rebase => vec!["rebase".to_string(), from_ref.clone()],
+            WorktreeSyncMode::Merge => vec![
+                "merge".to_string(),
+                "--ff-only".to_string(),
+                from_ref.clone(),
+            ],
+        };
+        let result = run_command_with_capture(&row.worktree.path, "git", &args)
+            .with_context(|| format!("failed to execute sync for {}", label))?;
+        if result.success {
+            summary.updated.push(label);
+        } else {
+            let reason = result
+                .output_tail
+                .first()
+                .cloned()
+                .unwrap_or_else(|| format!("exit {}", result.exit_code));
+            summary.failed.push((label, reason));
+        }
+    }
+
+    refresh_worktrees_with_selection(state, preferred.as_deref())?;
+
+    let mut message = format!(
+        "Sync {} from {}: updated {}, skipped {}, failed {}.",
+        request.mode.label(),
+        from_ref,
+        summary.updated.len(),
+        summary.skipped.len(),
+        summary.failed.len()
+    );
+    if let Some((path, reason)) = summary.failed.first() {
+        message.push_str(&format!(
+            " first failure: {path} ({})",
+            trim_middle(reason, 50)
+        ));
+    }
+    state.worktrees.message = if summary.failed.is_empty() {
+        DashboardMessage::success(message)
+    } else {
+        DashboardMessage::error(message)
+    };
+    Ok(())
+}
+
+fn perform_worktree_task(state: &mut CockpitState, request: &WorktreeTaskRequest) -> Result<()> {
+    let row = resolve_worktree_target(&state.worktrees, request.target.as_deref())?;
+    let command =
+        resolve_worktree_task_command(&row.worktree.path, request.preset).with_context(|| {
+            format!(
+                "could not resolve `{}` preset for {}",
+                request.preset.label(),
+                display_path(&row.worktree.path)
+            )
+        })?;
+    let (program, args) = command
+        .split_first()
+        .ok_or_else(|| anyhow!("task command is empty"))?;
+    let result = run_command_with_capture(&row.worktree.path, program, args)?;
+
+    refresh_worktrees_with_selection(state, Some(&row.worktree.path.display().to_string()))?;
+    let command_display = command.join(" ");
+    state.worktrees.last_task = Some(WorktreeTaskResult {
+        target_path: row.worktree.path.clone(),
+        preset: request.preset,
+        command: command_display.clone(),
+        success: result.success,
+        exit_code: result.exit_code,
+        duration: result.duration,
+        output_tail: result.output_tail.clone(),
+        finished_at_epoch: now_epoch(),
+    });
+    state.worktrees.message = if result.success {
+        DashboardMessage::success(format!(
+            "{} passed in {} for {} ({})",
+            request.preset.label(),
+            format_duration_short(result.duration),
+            display_path(&row.worktree.path),
+            command_display
+        ))
+    } else {
+        let output = result
+            .output_tail
+            .first()
+            .cloned()
+            .unwrap_or_else(|| format!("exit {}", result.exit_code));
+        DashboardMessage::error(format!(
+            "{} failed (exit {}) for {}: {}",
+            request.preset.label(),
+            result.exit_code,
+            display_path(&row.worktree.path),
+            trim_middle(&output, 80)
+        ))
+    };
+    Ok(())
+}
+
+fn resolve_worktree_task_command(path: &Path, preset: WorktreeTaskPreset) -> Result<Vec<String>> {
+    if let Some(node_command) = resolve_node_task_command(path, preset)? {
+        return Ok(node_command);
+    }
+
+    if path.join("Cargo.toml").exists() {
+        let command = match preset {
+            WorktreeTaskPreset::Test => vec!["cargo".to_string(), "test".to_string()],
+            WorktreeTaskPreset::Lint => vec![
+                "cargo".to_string(),
+                "clippy".to_string(),
+                "--all-targets".to_string(),
+                "--all-features".to_string(),
+            ],
+            WorktreeTaskPreset::Build => vec!["cargo".to_string(), "build".to_string()],
+        };
+        return Ok(command);
+    }
+
+    if path.join("go.mod").exists() {
+        let command = match preset {
+            WorktreeTaskPreset::Test => {
+                vec!["go".to_string(), "test".to_string(), "./...".to_string()]
+            }
+            WorktreeTaskPreset::Lint => {
+                vec!["go".to_string(), "vet".to_string(), "./...".to_string()]
+            }
+            WorktreeTaskPreset::Build => {
+                vec!["go".to_string(), "build".to_string(), "./...".to_string()]
+            }
+        };
+        return Ok(command);
+    }
+
+    if path.join("pyproject.toml").exists() {
+        let command = match preset {
+            WorktreeTaskPreset::Test => {
+                vec![
+                    "python3".to_string(),
+                    "-m".to_string(),
+                    "pytest".to_string(),
+                ]
+            }
+            WorktreeTaskPreset::Lint => vec![
+                "python3".to_string(),
+                "-m".to_string(),
+                "ruff".to_string(),
+                "check".to_string(),
+                ".".to_string(),
+            ],
+            WorktreeTaskPreset::Build => {
+                vec!["python3".to_string(), "-m".to_string(), "build".to_string()]
+            }
+        };
+        return Ok(command);
+    }
+
+    bail!(
+        "no preset runner found for {} in {}",
+        preset.label(),
+        display_path(path)
+    )
+}
+
+fn resolve_node_task_command(
+    path: &Path,
+    preset: WorktreeTaskPreset,
+) -> Result<Option<Vec<String>>> {
+    let package_json = path.join("package.json");
+    if !package_json.exists() {
+        return Ok(None);
+    }
+    let raw = fs::read_to_string(&package_json)
+        .with_context(|| format!("failed to read {}", package_json.display()))?;
+    let parsed: Value =
+        serde_json::from_str(&raw).context("failed to parse package.json while resolving task")?;
+    let has_script = parsed
+        .get("scripts")
+        .and_then(Value::as_object)
+        .map(|scripts| scripts.contains_key(preset.label()))
+        .unwrap_or(false);
+    if !has_script {
+        return Ok(None);
+    }
+
+    let command = if path.join("pnpm-lock.yaml").exists() || path.join("pnpm-lock.yml").exists() {
+        vec![
+            "pnpm".to_string(),
+            "run".to_string(),
+            preset.label().to_string(),
+        ]
+    } else if path.join("yarn.lock").exists() {
+        vec!["yarn".to_string(), preset.label().to_string()]
+    } else if path.join("bun.lockb").exists() || path.join("bun.lock").exists() {
+        vec![
+            "bun".to_string(),
+            "run".to_string(),
+            preset.label().to_string(),
+        ]
+    } else {
+        vec![
+            "npm".to_string(),
+            "run".to_string(),
+            preset.label().to_string(),
+        ]
+    };
+
+    Ok(Some(command))
+}
+
+fn run_command_with_capture(
+    cwd: &Path,
+    program: &str,
+    args: &[String],
+) -> Result<CommandRunResult> {
+    let started = Instant::now();
+    let output = Command::new(program)
+        .args(args)
+        .current_dir(cwd)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .with_context(|| format!("failed to execute `{}` in {}", program, cwd.display()))?;
+    let duration = started.elapsed();
+    let mut merged = String::new();
+    if !output.stdout.is_empty() {
+        merged.push_str(&String::from_utf8_lossy(&output.stdout));
+    }
+    if !output.stderr.is_empty() {
+        if !merged.is_empty() {
+            merged.push('\n');
+        }
+        merged.push_str(&String::from_utf8_lossy(&output.stderr));
+    }
+
+    Ok(CommandRunResult {
+        success: output.status.success(),
+        exit_code: output.status.code().unwrap_or(1),
+        duration,
+        output_tail: render_command_output_tail(&merged, 6),
+    })
+}
+
+fn render_command_output_tail(output: &str, max_lines: usize) -> Vec<String> {
+    let mut lines: Vec<String> = output
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(|line| trim_middle(line, 100))
+        .collect();
+    if lines.len() > max_lines {
+        lines = lines.split_off(lines.len() - max_lines);
+    }
+    lines
+}
+
+fn args_for_worktree_resume(operation: WorktreeOperation, continue_op: bool) -> Vec<String> {
+    let flag = if continue_op { "--continue" } else { "--abort" };
+    match operation {
+        WorktreeOperation::Rebase => vec!["rebase".to_string(), flag.to_string()],
+        WorktreeOperation::Merge => vec!["merge".to_string(), flag.to_string()],
+        WorktreeOperation::CherryPick => vec!["cherry-pick".to_string(), flag.to_string()],
+    }
+}
+
+fn resolve_worktree_target(
+    state: &WorktreeDashboardState,
+    target: Option<&str>,
+) -> Result<WorktreeRow> {
+    let Some(repo) = state.repo.as_ref() else {
+        bail!("no git repository is available from the current directory");
+    };
+
+    let Some(target) = target else {
+        return state
+            .selected_row()
+            .cloned()
+            .or_else(|| state.all_rows.first().cloned())
+            .ok_or_else(|| anyhow!("no worktree is selected"));
+    };
+
+    let input_path = absolutize_target_path(target)?;
+    if let Some(row) = state
+        .all_rows
+        .iter()
+        .find(|row| row.worktree.path == input_path || row.worktree.path == Path::new(target))
+    {
+        return Ok(row.clone());
+    }
+
+    if let Some(row) = state
+        .all_rows
+        .iter()
+        .find(|row| row.worktree.branch.as_deref() == Some(target))
+    {
+        return Ok(row.clone());
+    }
+
+    if repo.worktrees.is_empty() {
+        bail!("no git worktrees are available")
+    }
+
+    bail!("no worktree matches `{}`", target)
+}
+
+fn worktree_target_matches(state: &WorktreeDashboardState, target: &str) -> bool {
+    resolve_worktree_target(state, Some(target)).is_ok()
+}
+
+fn require_repo_snapshot(state: &mut CockpitState) -> Result<RepoSnapshot> {
+    if state.worktrees.repo.is_none() {
+        state.worktrees.apply_repo(discover_current_repo()?);
+    }
+    state
+        .worktrees
+        .repo
+        .clone()
+        .ok_or_else(|| anyhow!("no git repository is available from the current directory"))
+}
+
+fn refresh_worktrees_with_selection(
+    state: &mut CockpitState,
+    preferred: Option<&str>,
+) -> Result<()> {
+    state.worktrees.apply_repo(discover_current_repo()?);
+    state.worktrees.rebuild_rows(preferred);
+    Ok(())
+}
+
+fn absolutize_target_path(target: &str) -> Result<PathBuf> {
+    let path = PathBuf::from(target);
+    let resolved = if path.is_absolute() {
+        path
+    } else {
+        std::env::current_dir()
+            .context("failed to determine current directory")?
+            .join(path)
+    };
+    Ok(fs::canonicalize(&resolved).unwrap_or(resolved))
+}
+
+impl ResetMode {
+    fn flag(self) -> &'static str {
+        match self {
+            ResetMode::Soft => "--soft",
+            ResetMode::Mixed => "--mixed",
+            ResetMode::Hard => "--hard",
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            ResetMode::Soft => "soft",
+            ResetMode::Mixed => "mixed",
+            ResetMode::Hard => "hard",
+        }
+    }
+}
+
+impl WorktreeSyncMode {
+    fn parse(value: &str) -> Result<Self> {
+        match value.to_ascii_lowercase().as_str() {
+            "rebase" => Ok(Self::Rebase),
+            "merge" => Ok(Self::Merge),
+            other => bail!("unknown sync mode `{other}`"),
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            WorktreeSyncMode::Rebase => "rebase",
+            WorktreeSyncMode::Merge => "merge",
+        }
+    }
+}
+
+impl WorktreeTaskPreset {
+    fn parse(value: &str) -> Result<Self> {
+        match value.to_ascii_lowercase().as_str() {
+            "test" => Ok(Self::Test),
+            "lint" => Ok(Self::Lint),
+            "build" => Ok(Self::Build),
+            other => bail!("unknown task preset `{other}`"),
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            WorktreeTaskPreset::Test => "test",
+            WorktreeTaskPreset::Lint => "lint",
+            WorktreeTaskPreset::Build => "build",
+        }
     }
 }
 
@@ -2364,6 +4791,14 @@ fn parse_http_status_code(status_line: &str) -> Option<u16> {
 }
 
 fn open_url(url: &str) -> Result<()> {
+    open_target(url)
+}
+
+fn open_path(path: &Path) -> Result<()> {
+    open_target(path)
+}
+
+fn open_target(target: impl AsRef<std::ffi::OsStr>) -> Result<()> {
     let program = if cfg!(target_os = "macos") {
         "open"
     } else if cfg!(target_os = "linux") {
@@ -2373,11 +4808,11 @@ fn open_url(url: &str) -> Result<()> {
     };
 
     let status = Command::new(program)
-        .arg(url)
+        .arg(target)
         .status()
         .with_context(|| format!("failed to execute {}", program))?;
     if !status.success() {
-        bail!("{} returned non-zero status for {}", program, url);
+        bail!("{} returned non-zero status", program);
     }
     Ok(())
 }
@@ -2419,7 +4854,7 @@ fn build_dashboard_rows(snapshot: &Snapshot) -> Vec<DashboardRow> {
     rows
 }
 
-fn render_dashboard(stdout: &mut io::Stdout, state: &DashboardState, args: &MapArgs) -> Result<()> {
+fn render_dashboard(stdout: &mut io::Stdout, state: &CockpitState, args: &MapArgs) -> Result<()> {
     let (width, height) = terminal::size().context("failed to read terminal size")?;
     let width = width as usize;
     let height = height as usize;
@@ -2443,97 +4878,37 @@ fn render_dashboard(stdout: &mut io::Stdout, state: &DashboardState, args: &MapA
 }
 
 fn build_dashboard_lines(
-    state: &DashboardState,
+    state: &CockpitState,
     args: &MapArgs,
     width: usize,
     height: usize,
 ) -> Vec<String> {
-    let summary = build_dashboard_summary(&state.snapshot);
-    let free_port_list = free_ports(
-        DEFAULT_AVAILABLE_FROM,
-        DEFAULT_AVAILABLE_TO,
-        &state.snapshot.active,
-        8,
-    );
-    let free_ports = if free_port_list.is_empty() {
-        "none".to_string()
-    } else {
-        free_port_list
-            .iter()
-            .map(u16::to_string)
-            .collect::<Vec<_>>()
-            .join(", ")
+    let has_rows = match state.view {
+        CockpitView::Ports => !state.ports.rows.is_empty(),
+        CockpitView::Worktrees => !state.worktrees.rows.is_empty(),
     };
-    let released_count = state
-        .snapshot
-        .state
-        .ports
-        .values()
-        .filter(|entry| entry.last_status == PersistedStatus::Released)
-        .count();
-
-    let (list_height, detail_height) = dashboard_layout(height, !state.rows.is_empty());
+    let (list_height, detail_height) = dashboard_layout(height, has_rows);
     let list_inner_width = width.saturating_sub(2);
 
     let mut lines = Vec::with_capacity(height);
-    lines.push(box_top(width, "Overview"));
-    lines.push(box_line(
-        width,
-        &format!(
-            "ports:{}  processes:{}  stale:{}  projects:{}",
-            summary.ports, summary.processes, summary.stale, summary.projects
-        ),
-    ));
-    lines.push(box_line(
-        width,
-        &format!(
-            "free:{}  released:{}  refresh:{}  stale-after:{}",
-            free_ports,
-            released_count,
-            format_duration_short(args.refresh_every),
-            format_duration_short(args.stale_after)
-        ),
-    ));
-    lines.push(box_line(
-        width,
-        &format!(
-            "filter:{}  sort:{}  visible:{}/{}",
-            state.filter_label(),
-            state.sort_label(),
-            state.rows.len(),
-            state.all_rows.len()
-        ),
-    ));
+    lines.push(box_top(width, &format!("Cockpit ({})", state.view.label())));
+    let overview = build_overview_lines(state, args);
+    for line in overview {
+        lines.push(box_line(width, &line));
+    }
     lines.push(box_bottom(width));
 
-    lines.push(box_top(
+    lines.push(box_top(width, &active_list_title(state)));
+    lines.push(box_line(
         width,
-        &format!("Sessions ({}/{})", state.rows.len(), state.all_rows.len()),
+        &active_list_header(state, list_inner_width),
     ));
-    lines.push(box_line(width, &format_session_header(list_inner_width)));
-
-    let start = visible_row_start(state.selected, state.rows.len(), list_height);
-    for offset in 0..list_height {
-        let index = start + offset;
-        if let Some(row) = state.rows.get(index) {
-            lines.push(box_line(
-                width,
-                &format_session_row(
-                    row,
-                    list_inner_width,
-                    index == state.selected,
-                    state.health_for(row),
-                ),
-            ));
-        } else if state.rows.is_empty() && offset == 0 {
-            lines.push(box_line(
-                width,
-                "No rows match current filter. Use `clear`, `filter ...`, or `refresh`.",
-            ));
-        } else {
-            lines.push(box_line(width, ""));
-        }
-    }
+    lines.extend(build_list_lines(
+        state,
+        width,
+        list_inner_width,
+        list_height,
+    ));
     lines.push(box_bottom(width));
 
     lines.push(box_top(
@@ -2545,7 +4920,7 @@ fn build_dashboard_lines(
         },
     ));
     let detail_lines = if state.show_command_menu {
-        build_command_menu_lines()
+        build_command_menu_lines(state.view)
     } else {
         build_detail_lines(state)
     };
@@ -2560,8 +4935,13 @@ fn build_dashboard_lines(
     }
     lines.push(box_bottom(width));
 
-    lines.push("Hotkeys: ?/F1 menu, Esc close/clear, Ctrl+C quit".to_string());
-    lines.push(format!("Status: {}", state.message.render()));
+    lines.push("Hotkeys: Tab switch view, ?/F1 menu, Esc clear/cancel, Ctrl+C quit".to_string());
+    let status = state
+        .pending_confirmation
+        .as_ref()
+        .map(|pending| format!("[confirm] {} (yes/no)", pending.prompt))
+        .unwrap_or_else(|| state.active_message().render());
+    lines.push(format!("Status: {}", status));
     lines.push(format!(
         "Command > {}",
         visible_input_tail(&state.input, width.saturating_sub(10))
@@ -2608,6 +4988,109 @@ fn build_dashboard_summary(snapshot: &Snapshot) -> DashboardExportSummary {
     }
 }
 
+fn build_worktree_summary(repo: Option<&RepoSnapshot>) -> Option<DashboardExportRepo> {
+    let repo = repo?;
+    Some(DashboardExportRepo {
+        root: repo.root.clone(),
+        common_dir: repo.common_dir.clone(),
+        worktree_count: repo.worktrees.len(),
+        dirty: repo.worktrees.iter().filter(|item| item.is_dirty()).count(),
+        locked: repo.worktrees.iter().filter(|item| item.locked).count(),
+        prunable: repo.worktrees.iter().filter(|item| item.prunable).count(),
+        detached: repo.worktrees.iter().filter(|item| item.detached).count(),
+    })
+}
+
+fn build_overview_lines(state: &CockpitState, args: &MapArgs) -> Vec<String> {
+    match state.view {
+        CockpitView::Ports => {
+            let summary = build_dashboard_summary(&state.ports.snapshot);
+            let free_port_list = free_ports(
+                DEFAULT_AVAILABLE_FROM,
+                DEFAULT_AVAILABLE_TO,
+                &state.ports.snapshot.active,
+                8,
+            );
+            let free_ports = if free_port_list.is_empty() {
+                "none".to_string()
+            } else {
+                free_port_list
+                    .iter()
+                    .map(u16::to_string)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            };
+            let released_count = state
+                .ports
+                .snapshot
+                .state
+                .ports
+                .values()
+                .filter(|entry| entry.last_status == PersistedStatus::Released)
+                .count();
+            vec![
+                format!(
+                    "ports:{}  processes:{}  stale:{}  projects:{}",
+                    summary.ports, summary.processes, summary.stale, summary.projects
+                ),
+                format!(
+                    "free:{}  released:{}  refresh:{}  stale-after:{}",
+                    free_ports,
+                    released_count,
+                    format_duration_short(args.refresh_every),
+                    format_duration_short(args.stale_after)
+                ),
+                format!(
+                    "filter:{}  sort:{}  visible:{}/{}  Tab -> Worktrees",
+                    state.ports.filter_label(),
+                    state.ports.sort_label(),
+                    state.ports.rows.len(),
+                    state.ports.all_rows.len()
+                ),
+            ]
+        }
+        CockpitView::Worktrees => {
+            let summary = build_worktree_summary(state.worktrees.repo.as_ref());
+            match summary {
+                Some(summary) => vec![
+                    format!(
+                        "repo:{}  worktrees:{}  dirty:{}  locked:{}",
+                        display_path(&summary.root),
+                        summary.worktree_count,
+                        summary.dirty,
+                        summary.locked
+                    ),
+                    format!(
+                        "detached:{}  prunable:{}  refresh:{}  common:{}",
+                        summary.detached,
+                        summary.prunable,
+                        format_duration_short(args.refresh_every),
+                        display_path(&summary.common_dir)
+                    ),
+                    format!(
+                        "filter:{}  sort:{}  visible:{}/{}  Tab -> Ports",
+                        state.worktrees.filter_label(),
+                        state.worktrees.sort_label(),
+                        state.worktrees.rows.len(),
+                        state.worktrees.all_rows.len()
+                    ),
+                ],
+                None => vec![
+                    "repo:none  worktrees:0  dirty:0  locked:0".to_string(),
+                    format!(
+                        "detached:0  prunable:0  refresh:{}  current:{}",
+                        format_duration_short(args.refresh_every),
+                        display_path(
+                            &std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
+                        )
+                    ),
+                    "filter:none  sort:state desc  visible:0/0  Tab -> Ports".to_string(),
+                ],
+            }
+        }
+    }
+}
+
 fn box_top(width: usize, title: &str) -> String {
     if width == 0 {
         return String::new();
@@ -2647,7 +5130,14 @@ fn box_line(width: usize, content: &str) -> String {
     format!("│{}{}│", body, " ".repeat(padding))
 }
 
-fn build_detail_lines(state: &DashboardState) -> Vec<String> {
+fn build_detail_lines(state: &CockpitState) -> Vec<String> {
+    match state.view {
+        CockpitView::Ports => build_port_detail_lines(&state.ports),
+        CockpitView::Worktrees => build_worktree_detail_lines(&state.worktrees),
+    }
+}
+
+fn build_port_detail_lines(state: &DashboardState) -> Vec<String> {
     let Some(row) = state.selected_row() else {
         let mut lines = vec![
             "No selection.".to_string(),
@@ -2738,34 +5228,350 @@ fn build_detail_lines(state: &DashboardState) -> Vec<String> {
     ]
 }
 
-fn build_command_menu_lines() -> Vec<String> {
-    vec![
-        "Session actions".to_string(),
-        "  restart [pid|port] [--port N]    restart selected/target session".to_string(),
-        "  quick stale                      kill stale sessions".to_string(),
-        "  quick old                        kill sessions older than 2h".to_string(),
-        "  quick restart-old                restart sessions older than 2h".to_string(),
-        "  kill [port|pid]                  terminate selected/target".to_string(),
-        "  move <new-port>                  move selected session".to_string(),
-        "  move <from-port> <new-port>      move specific port owner".to_string(),
-        "Discovery and view".to_string(),
-        "  filter <expr>                    stale|active|health:*|port:*|project:*|cmd:*"
-            .to_string(),
-        "  sort <key> [asc|desc]            port|project|age|state|health".to_string(),
-        "  sort new-old | sort old-new      age shorthands".to_string(),
-        "  clear                            reset filter + sort".to_string(),
-        "  open [port|pid]                  open selected/target URL in browser".to_string(),
-        "  select <port|pid>                jump to row".to_string(),
-        "System".to_string(),
-        "  refresh                          force refresh now".to_string(),
-        "  download [file]                  export JSON snapshot".to_string(),
-        "  help                             show short help in status".to_string(),
-        "  quit                             exit dashboard".to_string(),
-        "Hotkeys".to_string(),
-        "  ? or F1                          toggle this menu".to_string(),
-        "  Esc                              close menu or clear input".to_string(),
-        "  Ctrl+C                           quit".to_string(),
-    ]
+fn build_worktree_detail_lines(state: &WorktreeDashboardState) -> Vec<String> {
+    let Some(row) = state.selected_row() else {
+        return vec![
+            "No worktree selected.".to_string(),
+            state.repo.as_ref().map_or_else(
+                || "Not inside a git repository.".to_string(),
+                |repo| format!("Repo root: {}", display_path(&repo.root)),
+            ),
+            "Hints: Tab -> Worktrees, new feature-x, sync all --from main, task test, sort stale desc"
+                .to_string(),
+        ];
+    };
+
+    let worktree = &row.worktree;
+    let upstream = worktree.upstream.as_deref().unwrap_or("-");
+    let origin_ref = worktree.origin_ref.as_deref().unwrap_or("-");
+    let base_ref = worktree.base_ref.as_deref().unwrap_or("-");
+    let git_dir = worktree
+        .git_dir
+        .as_ref()
+        .map(|path| display_path(path))
+        .unwrap_or_else(|| "unknown".to_string());
+    let last_commit = worktree.last_commit.as_ref().map_or_else(
+        || "unknown".to_string(),
+        |commit| {
+            format!(
+                "{} {} {}",
+                commit.short_oid,
+                relative_time(commit.committed_at_epoch),
+                commit.subject
+            )
+        },
+    );
+    let mut lines = vec![
+        format!("Path: {}", display_path(&worktree.path)),
+        format!(
+            "Kind / Branch: {} / {}",
+            worktree.kind_label(),
+            worktree.branch_label()
+        ),
+        format!(
+            "Sync / Flags: {} / +{} -{} / {}",
+            upstream,
+            worktree.ahead,
+            worktree.behind,
+            worktree.flag_summary()
+        ),
+        format!(
+            "Origin sync: {} / +{} -{}",
+            origin_ref, worktree.origin_ahead, worktree.origin_behind
+        ),
+        format!(
+            "Base sync: {} / +{} -{} / merged:{}",
+            base_ref,
+            worktree.base_ahead,
+            worktree.base_behind,
+            match worktree.merged_into_base {
+                Some(true) => "yes",
+                Some(false) => "no",
+                None => "?",
+            }
+        ),
+        format!(
+            "Changes: staged:{}  unstaged:{}  untracked:{}  conflicted:{}",
+            worktree.staged.len(),
+            worktree.unstaged.len(),
+            worktree.untracked.len(),
+            worktree.conflicted.len()
+        ),
+        format!(
+            "Stale score: {}  Last checkout: {}",
+            worktree.stale_score(now_epoch()),
+            worktree
+                .last_checkout_epoch
+                .map(relative_time)
+                .unwrap_or_else(|| "unknown".to_string())
+        ),
+        format!(
+            "Preview: {}",
+            trim_middle(&worktree_changed_file_preview(worktree, 3), 80)
+        ),
+    ];
+
+    if worktree.locked {
+        lines.push(format!(
+            "Lock reason: {}",
+            worktree.lock_reason.as_deref().unwrap_or("-")
+        ));
+    }
+    if worktree.prunable {
+        lines.push(format!(
+            "Prunable: {}",
+            worktree.prunable_reason.as_deref().unwrap_or("yes")
+        ));
+    }
+
+    lines.push("Changed files:".to_string());
+    lines.extend(render_file_section("staged", &worktree.staged));
+    lines.extend(render_file_section("unstaged", &worktree.unstaged));
+    lines.extend(render_file_section("untracked", &worktree.untracked));
+    lines.extend(render_file_section("conflicted", &worktree.conflicted));
+    lines.push(format!("Git dir: {}", git_dir));
+    lines.push(format!("Last commit: {}", trim_middle(&last_commit, 80)));
+    if let Some(task) = state
+        .last_task
+        .as_ref()
+        .filter(|task| task.target_path == worktree.path)
+    {
+        lines.push(format!(
+            "Last task: {} {} (exit {}, {}, {})",
+            task.preset.label(),
+            if task.success { "ok" } else { "failed" },
+            task.exit_code,
+            format_duration_short(task.duration),
+            relative_time(task.finished_at_epoch)
+        ));
+        lines.push(format!("Task cmd: {}", trim_middle(&task.command, 80)));
+        lines.push("Task output:".to_string());
+        if task.output_tail.is_empty() {
+            lines.push("  (no output)".to_string());
+        } else {
+            for line in &task.output_tail {
+                lines.push(format!("  {}", trim_middle(line, 80)));
+            }
+        }
+    }
+    lines.push(
+        "Hints: new|open|switch|move|lock|unlock|remove|sync|task|test|lint|build|prune|pick|merge|rebase|reset".to_string(),
+    );
+    lines
+}
+
+fn render_file_section(label: &str, files: &[String]) -> Vec<String> {
+    if files.is_empty() {
+        return vec![format!("  {}: none", label)];
+    }
+
+    let mut lines = vec![format!("  {}:", label)];
+    for file in files.iter().take(6) {
+        lines.push(format!("    {}", trim_middle(file, 72)));
+    }
+    if files.len() > 6 {
+        lines.push(format!("    ... {} more", files.len() - 6));
+    }
+    lines
+}
+
+fn worktree_changed_file_preview(worktree: &WorktreeRecord, max_items: usize) -> String {
+    let mut entries = Vec::new();
+    entries.extend(
+        worktree
+            .conflicted
+            .iter()
+            .map(|path| format!("conflict:{path}")),
+    );
+    entries.extend(worktree.staged.iter().map(|path| format!("staged:{path}")));
+    entries.extend(
+        worktree
+            .unstaged
+            .iter()
+            .map(|path| format!("unstaged:{path}")),
+    );
+    entries.extend(
+        worktree
+            .untracked
+            .iter()
+            .map(|path| format!("untracked:{path}")),
+    );
+
+    if entries.is_empty() {
+        return "none".to_string();
+    }
+
+    let preview = entries
+        .iter()
+        .take(max_items)
+        .map(|item| trim_middle(item, 28))
+        .collect::<Vec<_>>()
+        .join(", ");
+    if entries.len() > max_items {
+        format!("{preview} +{}", entries.len() - max_items)
+    } else {
+        preview
+    }
+}
+
+fn build_command_menu_lines(view: CockpitView) -> Vec<String> {
+    let mut lines = vec![
+        "Global".to_string(),
+        "  ports / worktrees                jump directly between cockpit views".to_string(),
+        "  view ports|worktrees             explicit view switch command".to_string(),
+        "  help [ports|worktrees|commands]  open contextual help".to_string(),
+        "  refresh                          refresh active view".to_string(),
+        "  download [file]                  export ports + worktrees snapshot".to_string(),
+        "  yes / no                         confirm or cancel a pending action".to_string(),
+        "  quit                             exit cockpit".to_string(),
+    ];
+
+    match view {
+        CockpitView::Ports => {
+            lines.extend([
+                "Ports".to_string(),
+                "  restart [pid|port] [--port N]   restart selected/target session".to_string(),
+                "  quick stale|old|restart-old     run bulk port actions".to_string(),
+                "  kill [port|pid]                 terminate selected/target".to_string(),
+                "  move <new-port>                 move selected session".to_string(),
+                "  filter <expr>                   stale|active|health:*|port:*|project:*|cmd:*"
+                    .to_string(),
+                "  sort <key> [asc|desc]           port|project|age|state|health".to_string(),
+                "  clear                           reset filter + sort".to_string(),
+                "  open [port|pid]                 open selected/target URL".to_string(),
+                "  select <port|pid>               jump to row".to_string(),
+            ]);
+        }
+        CockpitView::Worktrees => {
+            lines.extend([
+                "Worktrees".to_string(),
+                "  Bare verbs work here: `new`, `switch`, `remove`, `pick`, `merge`, `rebase`"
+                    .to_string(),
+                "  Prefixes `wt`, `worktree`, and `worktrees` also work if you want explicit scoping"
+                    .to_string(),
+                "  new <branch> [--from ref]       create branch + sibling worktree path automatically"
+                    .to_string(),
+                "  add <path> [--branch N] [--from ref] [--detach] [--no-checkout] [--lock]"
+                    .to_string(),
+                "  open [target] / switch <ref> [target] [--create] [--track]".to_string(),
+                "  move <new-path> [target] / lock [target] [--reason txt] / unlock [target]"
+                    .to_string(),
+                "  remove [target] [--force] / sync [all|target] [--from ref] [--mode rebase|merge]"
+                    .to_string(),
+                "  sync flags: --include-dirty --include-main / prune [--dry-run] / cleanup [--dry-run]"
+                    .to_string(),
+                "  pick <commit...> [target] / merge <ref> [target] / rebase <ref> [target]"
+                    .to_string(),
+                "  reset <--soft|--mixed|--hard> <ref> [target] / continue [target] / abort [target]"
+                    .to_string(),
+                "  task <test|lint|build> [target]  or bare: test|lint|build [target]".to_string(),
+                "  filter <expr>                   dirty|clean|conflicted|locked|prunable|detached|branch:*|path:*"
+                    .to_string(),
+                "  sort <key> [asc|desc]           path|branch|sync|changes|state|stale".to_string(),
+                "  clear                           reset filter + sort".to_string(),
+                "  select <target>                 jump by exact path or branch".to_string(),
+            ]);
+        }
+    }
+
+    lines.push("Hotkeys".to_string());
+    lines.push("  Tab / Shift+Tab                 switch views".to_string());
+    lines.push("  ? or F1                         toggle this menu".to_string());
+    lines.push(
+        "  Esc                             close menu, clear input, or cancel pending".to_string(),
+    );
+    lines.push("  Ctrl+C                          quit".to_string());
+    lines
+}
+
+fn active_list_title(state: &CockpitState) -> String {
+    match state.view {
+        CockpitView::Ports => format!(
+            "Sessions ({}/{})  Tab -> Worktrees",
+            state.ports.rows.len(),
+            state.ports.all_rows.len()
+        ),
+        CockpitView::Worktrees => {
+            format!(
+                "Worktrees ({}/{})  Tab -> Ports",
+                state.worktrees.rows.len(),
+                state.worktrees.all_rows.len()
+            )
+        }
+    }
+}
+
+fn active_list_header(state: &CockpitState, width: usize) -> String {
+    match state.view {
+        CockpitView::Ports => format_session_header(width),
+        CockpitView::Worktrees => format_worktree_header(width),
+    }
+}
+
+fn build_list_lines(
+    state: &CockpitState,
+    width: usize,
+    list_inner_width: usize,
+    list_height: usize,
+) -> Vec<String> {
+    let mut lines = Vec::new();
+    match state.view {
+        CockpitView::Ports => {
+            let start =
+                visible_row_start(state.ports.selected, state.ports.rows.len(), list_height);
+            for offset in 0..list_height {
+                let index = start + offset;
+                if let Some(row) = state.ports.rows.get(index) {
+                    lines.push(box_line(
+                        width,
+                        &format_session_row(
+                            row,
+                            list_inner_width,
+                            index == state.ports.selected,
+                            state.ports.health_for(row),
+                        ),
+                    ));
+                } else if state.ports.rows.is_empty() && offset == 0 {
+                    lines.push(box_line(
+                        width,
+                        "No rows match current filter. Use `clear`, `filter ...`, or `refresh`.",
+                    ));
+                } else {
+                    lines.push(box_line(width, ""));
+                }
+            }
+        }
+        CockpitView::Worktrees => {
+            let start = visible_row_start(
+                state.worktrees.selected,
+                state.worktrees.rows.len(),
+                list_height,
+            );
+            for offset in 0..list_height {
+                let index = start + offset;
+                if let Some(row) = state.worktrees.rows.get(index) {
+                    lines.push(box_line(
+                        width,
+                        &format_worktree_row(
+                            row,
+                            list_inner_width,
+                            index == state.worktrees.selected,
+                        ),
+                    ));
+                } else if state.worktrees.rows.is_empty() && offset == 0 {
+                    let message = if state.worktrees.repo.is_none() {
+                        "No git repository found from the current directory."
+                    } else {
+                        "No worktrees match current filter. Use `clear`, `filter ...`, or `refresh`."
+                    };
+                    lines.push(box_line(width, message));
+                } else {
+                    lines.push(box_line(width, ""));
+                }
+            }
+        }
+    }
+    lines
 }
 
 fn format_session_header(width: usize) -> String {
@@ -2811,6 +5617,52 @@ fn format_session_row(
         "{}  {}",
         truncate_end(&row.owner.project_name, 16),
         truncate_end(&row.url(), 22)
+    );
+    let remaining = width.saturating_sub(prefix.chars().count());
+    format!("{}{}", prefix, truncate_end(&suffix, remaining))
+}
+
+fn format_worktree_header(width: usize) -> String {
+    let prefix = format!(
+        "{} {:<8} {:<18} {:<9} {:<10} ",
+        " ", "Kind", "Branch", "Sync", "Changes"
+    );
+    let remaining = width.saturating_sub(prefix.chars().count());
+    format!(
+        "{}{}",
+        prefix,
+        truncate_end("State  Stale  Files  Path", remaining)
+    )
+}
+
+fn format_worktree_row(row: &WorktreeRow, width: usize, selected: bool) -> String {
+    let marker = if selected { ">" } else { " " };
+    let sync = if row.worktree.upstream.is_some() {
+        format!("+{} -{}", row.worktree.ahead, row.worktree.behind)
+    } else {
+        "-".to_string()
+    };
+    let changes = format!(
+        "s{} u{} ?{} c{}",
+        row.worktree.staged.len(),
+        row.worktree.unstaged.len(),
+        row.worktree.untracked.len(),
+        row.worktree.conflicted.len()
+    );
+    let prefix = format!(
+        "{} {:<8} {:<18} {:<9} {:<10} ",
+        marker,
+        row.worktree.kind_label(),
+        truncate_end(&row.worktree.branch_label(), 18),
+        truncate_end(&sync, 9),
+        truncate_end(&changes, 10),
+    );
+    let suffix = format!(
+        "{}  {:>5}  {}  {}",
+        truncate_end(&row.worktree.flag_summary(), 18),
+        row.worktree.stale_score(now_epoch()),
+        truncate_end(&worktree_changed_file_preview(&row.worktree, 2), 28),
+        truncate_end(&display_path(&row.worktree.path), 30)
     );
     let remaining = width.saturating_sub(prefix.chars().count());
     format!("{}{}", prefix, truncate_end(&suffix, remaining))
@@ -2920,6 +5772,7 @@ fn resolve_export_path_from(cwd: &Path, path: Option<&str>) -> PathBuf {
 
 fn export_dashboard_snapshot(
     snapshot: &Snapshot,
+    repo: Option<&RepoSnapshot>,
     stale_after: Duration,
     path: &Path,
 ) -> Result<()> {
@@ -2974,6 +5827,55 @@ fn export_dashboard_snapshot(
         })
         .collect();
 
+    let repo_export = build_worktree_summary(repo);
+    let export_now = now_epoch();
+    let worktrees_export = repo.map(|repo| {
+        repo.worktrees
+            .iter()
+            .map(|worktree| DashboardExportWorktree {
+                path: worktree.path.clone(),
+                is_main: worktree.is_main,
+                branch: worktree.branch.clone(),
+                detached: worktree.detached,
+                locked: worktree.locked,
+                lock_reason: worktree.lock_reason.clone(),
+                prunable: worktree.prunable,
+                prunable_reason: worktree.prunable_reason.clone(),
+                upstream: worktree.upstream.clone(),
+                ahead: worktree.ahead,
+                behind: worktree.behind,
+                origin_ref: worktree.origin_ref.clone(),
+                origin_ahead: worktree.origin_ahead,
+                origin_behind: worktree.origin_behind,
+                base_ref: worktree.base_ref.clone(),
+                base_ahead: worktree.base_ahead,
+                base_behind: worktree.base_behind,
+                merged_into_base: worktree.merged_into_base,
+                head_oid: worktree.head_oid.clone(),
+                git_dir: worktree.git_dir.clone(),
+                operations: worktree
+                    .operations
+                    .iter()
+                    .map(|operation| operation.label().to_string())
+                    .collect(),
+                staged: worktree.staged.clone(),
+                unstaged: worktree.unstaged.clone(),
+                untracked: worktree.untracked.clone(),
+                conflicted: worktree.conflicted.clone(),
+                last_commit_epoch: worktree
+                    .last_commit
+                    .as_ref()
+                    .map(|commit| commit.committed_at_epoch),
+                last_commit_subject: worktree
+                    .last_commit
+                    .as_ref()
+                    .map(|commit| commit.subject.clone()),
+                last_checkout_epoch: worktree.last_checkout_epoch,
+                stale_score: worktree.stale_score(export_now),
+            })
+            .collect::<Vec<_>>()
+    });
+
     let export = DashboardExport {
         exported_at_epoch: now_epoch(),
         cwd: std::env::current_dir().context("failed to determine current directory")?,
@@ -2982,6 +5884,8 @@ fn export_dashboard_snapshot(
         free_ports,
         active,
         recent_released,
+        repo: repo_export,
+        worktrees: worktrees_export,
     };
 
     if let Some(parent) = path.parent() {
@@ -3363,7 +6267,9 @@ fn exit_code_from_status(status: ExitStatus) -> ExitCode {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::process::Command;
     use tempfile::tempdir;
+    use worktree::discover_repo_from;
 
     #[test]
     fn parses_lsof_output() {
@@ -3499,6 +6405,341 @@ mod tests {
                 key: DashboardSortKey::Age,
                 direction: SortDirection::Asc,
             })
+        );
+    }
+
+    #[test]
+    fn parses_worktree_add_and_reset_commands() {
+        let empty = WorktreeDashboardState::new(None);
+
+        match parse_worktree_command(
+            "add ../feature --branch feat --from main --lock --no-checkout",
+            &empty,
+        )
+        .expect("add")
+        {
+            WorktreeCommand::Add(request) => {
+                assert_eq!(request.path, "../feature");
+                assert_eq!(request.branch.as_deref(), Some("feat"));
+                assert_eq!(request.from_ref.as_deref(), Some("main"));
+                assert!(request.lock);
+                assert!(request.no_checkout);
+            }
+            other => panic!("expected add, got {:?}", other),
+        }
+
+        match parse_worktree_command("reset --hard HEAD~1", &empty).expect("reset") {
+            WorktreeCommand::Reset(request) => {
+                assert_eq!(request.mode, ResetMode::Hard);
+                assert_eq!(request.reference, "HEAD~1");
+                assert!(request.target.is_none());
+            }
+            other => panic!("expected reset, got {:?}", other),
+        }
+
+        match parse_worktree_command("create ../feature-2", &empty).expect("create") {
+            WorktreeCommand::Add(request) => {
+                assert_eq!(request.path, "../feature-2");
+                assert!(!request.implicit_path_from_branch);
+            }
+            other => panic!("expected add alias, got {:?}", other),
+        }
+
+        match parse_worktree_command("new feature/login --from main", &empty).expect("new") {
+            WorktreeCommand::Add(request) => {
+                assert_eq!(request.branch.as_deref(), Some("feature/login"));
+                assert_eq!(request.path, "../feature-login");
+                assert_eq!(request.from_ref.as_deref(), Some("main"));
+                assert!(request.implicit_path_from_branch);
+            }
+            other => panic!("expected add shorthand, got {:?}", other),
+        }
+
+        match parse_worktree_command("delete --force", &empty).expect("delete") {
+            WorktreeCommand::Remove(request) => {
+                assert!(request.force);
+                assert!(request.target.is_none());
+            }
+            other => panic!("expected remove alias, got {:?}", other),
+        }
+
+        match parse_worktree_command(
+            "sync all --from main --mode merge --include-dirty --include-main",
+            &empty,
+        )
+        .expect("sync")
+        {
+            WorktreeCommand::Sync(request) => {
+                assert!(request.all);
+                assert_eq!(request.from_ref.as_deref(), Some("main"));
+                assert_eq!(request.mode, WorktreeSyncMode::Merge);
+                assert!(request.include_dirty);
+                assert!(request.include_main);
+            }
+            other => panic!("expected sync, got {:?}", other),
+        }
+
+        match parse_worktree_command("task lint", &empty).expect("task") {
+            WorktreeCommand::Task(request) => {
+                assert_eq!(request.preset, WorktreeTaskPreset::Lint);
+                assert!(request.target.is_none());
+            }
+            other => panic!("expected task, got {:?}", other),
+        }
+
+        match parse_worktree_command("test feature-x", &empty).expect("test alias") {
+            WorktreeCommand::Task(request) => {
+                assert_eq!(request.preset, WorktreeTaskPreset::Test);
+                assert_eq!(request.target.as_deref(), Some("feature-x"));
+            }
+            other => panic!("expected task alias, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parses_worktree_stale_sort_key() {
+        let sort = parse_worktree_sort("stale desc").expect("stale sort");
+        assert_eq!(sort.key, WorktreeSortKey::Stale);
+        assert_eq!(sort.direction, SortDirection::Desc);
+    }
+
+    #[test]
+    fn parses_cherry_pick_target_from_worktree_state() {
+        let root = PathBuf::from("/tmp/repo");
+        let feature_path = root.join("feature");
+        let worktree = WorktreeRecord {
+            path: feature_path.clone(),
+            is_main: false,
+            bare: false,
+            head_oid: "abc".to_string(),
+            branch: Some("feature".to_string()),
+            detached: false,
+            locked: false,
+            lock_reason: None,
+            prunable: false,
+            prunable_reason: None,
+            upstream: None,
+            ahead: 0,
+            behind: 0,
+            origin_ref: None,
+            origin_ahead: 0,
+            origin_behind: 0,
+            base_ref: Some("main".to_string()),
+            base_ahead: 0,
+            base_behind: 0,
+            merged_into_base: Some(false),
+            staged: Vec::new(),
+            unstaged: Vec::new(),
+            untracked: Vec::new(),
+            conflicted: Vec::new(),
+            operations: Vec::new(),
+            last_commit: None,
+            last_checkout_epoch: None,
+            git_dir: None,
+        };
+        let state = WorktreeDashboardState {
+            repo: Some(RepoSnapshot {
+                root: root.clone(),
+                common_dir: root.join(".git"),
+                base_ref: Some("main".to_string()),
+                worktrees: vec![worktree.clone()],
+            }),
+            rows: vec![WorktreeRow {
+                worktree: worktree.clone(),
+            }],
+            all_rows: vec![WorktreeRow { worktree }],
+            selected: 0,
+            filter: None,
+            sort: WorktreeSort::default(),
+            message: DashboardMessage::info("test"),
+            last_task: None,
+        };
+
+        match parse_worktree_command("cherry-pick abc123 feature", &state).expect("command") {
+            WorktreeCommand::CherryPick(request) => {
+                assert_eq!(request.commits, vec!["abc123".to_string()]);
+                assert_eq!(request.target.as_deref(), Some("feature"));
+            }
+            other => panic!("expected cherry-pick, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn discovers_linked_worktrees_and_change_sets() {
+        let temp = tempdir().expect("tempdir");
+        let repo = temp.path().join("repo");
+        let feature = temp.path().join("feature-tree");
+        fs::create_dir_all(&repo).expect("repo dir");
+
+        git(&repo, &["init", "--initial-branch=main"]);
+        git(&repo, &["config", "user.name", "Port Map"]);
+        git(&repo, &["config", "user.email", "portmap@example.com"]);
+        fs::write(repo.join("tracked.txt"), "one\n").expect("tracked file");
+        git(&repo, &["add", "tracked.txt"]);
+        git(&repo, &["commit", "-m", "init"]);
+        git(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "feature",
+                feature.to_str().expect("path"),
+            ],
+        );
+
+        fs::write(repo.join("tracked.txt"), "one\nmain dirty\n").expect("main dirty");
+        fs::write(feature.join("feature.txt"), "feature staged\n").expect("feature file");
+        git(&feature, &["add", "feature.txt"]);
+        fs::write(feature.join("scratch.txt"), "feature untracked\n").expect("untracked");
+
+        let discovered = discover_repo_from(&repo)
+            .expect("discover repo")
+            .expect("repo exists");
+        assert_eq!(discovered.worktrees.len(), 2);
+        let feature = fs::canonicalize(feature).expect("canonical feature");
+
+        let main = discovered
+            .worktrees
+            .iter()
+            .find(|item| item.is_main)
+            .expect("main worktree");
+        assert!(main.unstaged.iter().any(|path| path == "tracked.txt"));
+
+        let linked = discovered
+            .worktrees
+            .iter()
+            .find(|item| item.path == feature)
+            .expect("linked worktree");
+        assert_eq!(linked.branch.as_deref(), Some("feature"));
+        assert!(linked.staged.iter().any(|path| path == "feature.txt"));
+        assert!(linked.untracked.iter().any(|path| path == "scratch.txt"));
+    }
+
+    #[test]
+    fn changed_file_preview_includes_specific_paths() {
+        let worktree = WorktreeRecord {
+            path: PathBuf::from("/tmp/repo"),
+            is_main: true,
+            bare: false,
+            head_oid: "abc".to_string(),
+            branch: Some("main".to_string()),
+            detached: false,
+            locked: false,
+            lock_reason: None,
+            prunable: false,
+            prunable_reason: None,
+            upstream: None,
+            ahead: 0,
+            behind: 0,
+            origin_ref: None,
+            origin_ahead: 0,
+            origin_behind: 0,
+            base_ref: Some("main".to_string()),
+            base_ahead: 0,
+            base_behind: 0,
+            merged_into_base: Some(true),
+            staged: vec!["src/main.rs".to_string()],
+            unstaged: vec!["README.md".to_string()],
+            untracked: vec!["notes.txt".to_string()],
+            conflicted: Vec::new(),
+            operations: Vec::new(),
+            last_commit: None,
+            last_checkout_epoch: None,
+            git_dir: None,
+        };
+
+        let preview = worktree_changed_file_preview(&worktree, 2);
+        assert!(preview.contains("staged:src/main.rs"));
+        assert!(preview.contains("unstaged:README.md"));
+        assert!(preview.ends_with("+1"));
+    }
+
+    #[test]
+    fn strips_prefixed_worktree_commands_and_detects_bare_aliases() {
+        assert_eq!(
+            strip_worktree_command_prefix("worktree add ../feature"),
+            Some("add ../feature")
+        );
+        assert_eq!(
+            strip_worktree_command_prefix("worktrees remove --force"),
+            Some("remove --force")
+        );
+        assert_eq!(
+            strip_worktree_command_prefix("wt switch main"),
+            Some("switch main")
+        );
+
+        assert!(is_bare_worktree_command("create ../feature"));
+        assert!(is_bare_worktree_command("pick abc123"));
+        assert!(is_bare_worktree_command("cleanup --dry-run"));
+        assert!(is_bare_worktree_command("sync all --from main"));
+        assert!(is_bare_worktree_command("task test"));
+        assert!(is_bare_worktree_command("build"));
+        assert!(!is_bare_worktree_command("open"));
+    }
+
+    #[test]
+    fn identifies_remove_safety_risks() {
+        let worktree = WorktreeRecord {
+            path: PathBuf::from("/tmp/repo-feature"),
+            is_main: false,
+            bare: false,
+            head_oid: "abc".to_string(),
+            branch: Some("feature".to_string()),
+            detached: false,
+            locked: true,
+            lock_reason: None,
+            prunable: false,
+            prunable_reason: None,
+            upstream: Some("origin/feature".to_string()),
+            ahead: 2,
+            behind: 0,
+            origin_ref: Some("origin/feature".to_string()),
+            origin_ahead: 2,
+            origin_behind: 0,
+            base_ref: Some("main".to_string()),
+            base_ahead: 5,
+            base_behind: 0,
+            merged_into_base: Some(false),
+            staged: vec!["src/main.rs".to_string()],
+            unstaged: Vec::new(),
+            untracked: Vec::new(),
+            conflicted: Vec::new(),
+            operations: vec![WorktreeOperation::Rebase],
+            last_commit: None,
+            last_checkout_epoch: None,
+            git_dir: None,
+        };
+
+        let risks = worktree_remove_safety_risks(&worktree);
+        assert!(risks.iter().any(|risk| risk == "locked"));
+        assert!(risks.iter().any(|risk| risk.starts_with("dirty:")));
+        assert!(risks.iter().any(|risk| risk.starts_with("in-progress:")));
+        assert!(risks.iter().any(|risk| risk == "unpushed:2"));
+        assert!(risks.iter().any(|risk| risk == "unmerged:main"));
+    }
+
+    #[test]
+    fn sanitizes_branch_name_for_default_new_path() {
+        assert_eq!(
+            default_new_worktree_path("feature/login"),
+            "../feature-login"
+        );
+        assert_eq!(default_new_worktree_path("fix.issue_42"), "../fix.issue_42");
+    }
+
+    fn git(cwd: &Path, args: &[&str]) {
+        let output = Command::new("git")
+            .args(args)
+            .current_dir(cwd)
+            .output()
+            .expect("git command");
+        assert!(
+            output.status.success(),
+            "git {:?} failed: {}",
+            args,
+            String::from_utf8_lossy(&output.stderr)
         );
     }
 }
